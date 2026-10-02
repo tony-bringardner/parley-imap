@@ -45,7 +45,12 @@ public class TestMessage {
 
 	@Test
 	public void testReadSimple() throws IOException, ParseException {
-		Message m = Message.read(new ByteArrayInputStream(crlf(SIMPLE)));
+		try (Message m = Message.read(new ByteArrayInputStream(crlf(SIMPLE)))) {
+			checkSimple(m);
+		}
+	}
+
+	private static void checkSimple(Message m) throws ParseException {
 		assertEquals(6, m.getHeaders().size());
 		assertEquals("Café meeting", m.getSubject());
 		assertEquals("<123@bringardner.us>", m.getMessageId());

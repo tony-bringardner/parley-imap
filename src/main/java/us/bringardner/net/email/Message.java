@@ -1,10 +1,13 @@
 package us.bringardner.net.email;
 
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.Serializable;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
@@ -14,7 +17,6 @@ import java.security.SecureRandom;
 import java.text.Normalizer;
 import java.text.ParseException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.Iterator;
@@ -22,29 +24,51 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
+import us.bringardner.io.filesource.FileSource;
+import us.bringardner.io.filesource.FileSourceFactory;
+
 /**
  * An Internet message (RFC 5322) with MIME structure (RFC 2045, 2046), whose
  * header parameters and encoded words are read and written according to
- * RFC 2231 and RFC 2047.
+ * RFC 2231 and RFC 2047, with internationalized headers per RFC 6532.
  * <p>
  * A Message holds an ordered list of headers and either a body or, for a
  * multipart message, a list of parts. Each part is itself a Message (a MIME
  * "entity"), so parts can be nested.
+ *
+ * <h2>Storage</h2>
+ * Messages of any size are supported. Only headers are held in memory: bodies,
+ * parts, preambles and epilogues are windows (offset, length) onto the
+ * {@link FileSource} the message was parsed from, and are only ever read through
+ * streams.
  * <ul>
- * <li>{@link #read(InputStream)} / {@link #parse(byte[])} read a message.
- *     Headers are unfolded, CRLF or bare LF line endings are accepted, and
- *     multipart bodies are split into parts.</li>
- * <li>{@link #writeTo(OutputStream)} / {@link #toByteArray()} write it with
- *     CRLF line endings and headers folded at 78 characters where possible.
- *     A message read with CRLF line endings and not changed is written back
- *     byte for byte.</li>
- * <li>{@link #setText(String)}, {@link #setContent(byte[], String)} and
- *     {@link #addAttachment(String, String, byte[])} build content, choosing
- *     the transfer encoding (7bit, quoted-printable or base64) and encoding
- *     non-ASCII file names per RFC 2231.</li>
- * <li>{@link #getText()}, {@link #getContent()}, {@link #getFilename()} and
- *     {@link #getContentType()} decode it again.</li>
+ * <li>{@link #parse(FileSource)} reads a message stored in a file, in place.
+ *     Parsing streams through the file once per level of multipart nesting.</li>
+ * <li>{@link #read(InputStream, FileSource)} stores a stream (e.g. an incoming SMTP
+ *     DATA section) in a file and parses it; {@link #read(InputStream)} uses a temp
+ *     file in the work directory.</li>
+ * <li>{@link #writeTo(OutputStream)} and {@link #writeTo(FileSource)} stream the
+ *     message out; writing back to the file it was parsed from is allowed.</li>
+ * <li>{@link #openContent()}, {@link #writeContentTo(OutputStream)} and
+ *     {@link #saveContent(FileSource)} decode a body as a stream;
+ *     {@link #setContent(FileSource, String)} and
+ *     {@link #addAttachment(String, String, FileSource)} encode large content as a
+ *     stream into a temp file in the {@link #getWorkDirectory() work directory}.</li>
+ * <li>{@link #close()} deletes the temp files the message created.</li>
  * </ul>
+ * The byte-array methods ({@link #parse(byte[])}, {@link #toByteArray()},
+ * {@link #getContent()}, {@link #getText()}, ...) remain for small messages and
+ * small parts; they hold the data in memory.
+ * <p>
+ * The file a message was parsed from must not be changed by anything else while
+ * the message is in use.
+ *
+ * <h2>Reading and writing</h2>
+ * Headers are unfolded on reading, CRLF or bare LF line endings are accepted, and
+ * multipart bodies are split into parts. Output always uses CRLF and folds headers
+ * at 78 octets where possible. A message read with CRLF line endings and not
+ * changed is written back byte for byte.
+ *
  * <h2>Internationalized headers (RFC 6532)</h2>
  * Header values are kept as Unicode. Raw UTF-8 headers are read as such, and how
  * headers are written depends on {@link #setUtf8Headers(boolean)}:
@@ -63,15 +87,12 @@ import java.util.Set;
  * the result contains raw UTF-8 headers. Unchanged headers of a parsed message are
  * always written exactly as they were read.
  * <p>
- * Attached messages (message/rfc822 and message/global parts) are parsed into a
- * Message available from {@link #getAttachedMessage()}; {@link #attachMessage(Message)}
- * adds one.
- * <p>
- * The whole message is kept in memory.
+ * Attached messages (message/rfc822 and message/global parts) are parsed on demand
+ * by {@link #getAttachedMessage()}; {@link #attachMessage(Message)} adds one.
  */
-public class Message implements Serializable {
+public class Message implements Serializable, AutoCloseable {
 
-	private static final long serialVersionUID = 1L;
+	private static final long serialVersionUID = 2L;
 
 	public static final String CRLF = "\r\n";
 	private static final byte[] CRLF_BYTES = {'\r', '\n'};
@@ -80,24 +101,10 @@ public class Message implements Serializable {
 	private static final int FOLD_AT = 78;
 	/** Lines in a 7bit or 8bit body must not be longer than this (without CRLF). */
 	private static final int MAX_LINE = 998;
-
-	private static final SecureRandom RANDOM = new SecureRandom();
-
-	protected final ArrayList<Header> headers = new ArrayList<>();
-	/** The body as transferred (still transfer-encoded); null when the message has parts. */
-	protected byte[] body = new byte[0];
-	protected final ArrayList<Message> parts = new ArrayList<>();
-	/** Multipart text before the first boundary; null if there was none. */
-	protected byte[] preamble;
-	/** Multipart text after the closing boundary line; null if the closing line ended the data. */
-	protected byte[] epilogue = new byte[0];
-	/** True for a body part (it doesn't get a MIME-Version header). */
-	protected boolean part;
-	/** Write headers as raw UTF-8 (RFC 6532) instead of RFC 2047/2231 encodings. */
-	protected boolean utf8Headers;
-	/** The parsed content of a message/rfc822 or message/global part, or null. */
-	protected Message attached;
-
+	/** A "header" line longer than this is taken as the start of the body. */
+	private static final int MAX_HEADER_LINE = 128 * 1024;
+	/** Header blocks larger than this end early; the rest is the body. */
+	private static final long MAX_HEADER_BYTES = 16L * 1024 * 1024;
 	/** Deeper nesting than this is kept as an unparsed body (protects against stack overflow). */
 	private static final int MAX_DEPTH = 50;
 
@@ -106,67 +113,141 @@ public class Message implements Serializable {
 	private static final Set<String> UNSTRUCTURED_HEADERS = Set.of("subject", "comments", "content-description",
 			"thread-topic");
 
+	private static final SecureRandom RANDOM = new SecureRandom();
+
+	private static volatile FileSource defaultWorkDirectory;
+
+	protected final ArrayList<Header> headers = new ArrayList<>();
+	/** The body as transferred (still transfer-encoded); null when the message has parts. */
+	protected Body body = Body.EMPTY;
+	protected final ArrayList<Message> parts = new ArrayList<>();
+	/** Multipart text before the first boundary; null if there was none. */
+	protected Body preamble;
+	/** Multipart text after the closing boundary line; null if the closing line ended the data. */
+	protected Body epilogue = Body.EMPTY;
+	/** True for a body part (it doesn't get a MIME-Version header). */
+	protected boolean part;
+	/** Write headers as raw UTF-8 (RFC 6532) instead of RFC 2047/2231 encodings. */
+	protected boolean utf8Headers;
+	/** The parsed content of a message/rfc822 or message/global part, once requested. */
+	protected Message attached;
+	protected boolean attachedLoaded;
+	/** Nesting depth (0 = top level). */
+	protected int depth;
+	/** For a parsed message or part: the stored bytes of its headers and body. */
+	protected Body source;
+	/** For a parsed message or part: the length of its header block in {@link #source}. */
+	protected long headerLength = -1;
+	/** Where temp files for this message go; null = the default. */
+	protected FileSource workDirectory;
+	/** Temp files this message created; deleted by close(). */
+	private transient List<FileSource> ownedFiles = new ArrayList<>();
+
 	public Message() {
 	}
 
 	// ------------------------------------------------------------------ reading
 
-	/** Read a whole message from the stream. The stream is read to its end but not closed. */
-	public static Message read(InputStream in) throws IOException {
-		return parse(in.readAllBytes());
-	}
-
-	/** Parse a message from bytes. */
-	public static Message parse(byte[] data) {
+	/**
+	 * Parse a message stored in a file. The message reads its bodies from the
+	 * file as needed, so the file must stay unchanged while the message is used.
+	 */
+	public static Message parse(FileSource file) throws IOException {
 		Message m = new Message();
-		m.load(data, 0, data.length, true, 0);
+		m.load(Body.of(file), true, 0);
 		return m;
 	}
 
-	private void load(byte[] data, int start, int end, boolean topLevel, int depth) {
+	/**
+	 * Store a stream (to its end) in {@code store} and parse it from there.
+	 * The stream is not closed.
+	 */
+	public static Message read(InputStream in, FileSource store) throws IOException {
+		try (OutputStream out = output(store)) {
+			Streams.copy(in, out);
+		}
+		return parse(store);
+	}
+
+	/**
+	 * Store a stream (to its end) in a temp file in the default work directory and
+	 * parse it from there. {@link #close()} deletes the temp file. The stream is not closed.
+	 */
+	public static Message read(InputStream in) throws IOException {
+		Message m = new Message();
+		FileSource f = m.createTempFile();
+		try (OutputStream out = output(f)) {
+			Streams.copy(in, out);
+		}
+		m.load(Body.of(f), true, 0);
+		return m;
+	}
+
+	/** Parse a small message held in memory. */
+	public static Message parse(byte[] data) {
+		Message m = new Message();
+		try {
+			m.load(Body.of(data), true, 0);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e); // can't happen in memory
+		}
+		return m;
+	}
+
+	private void load(Body entity, boolean topLevel, int depth) throws IOException {
+		this.depth = depth;
 		headers.clear();
 		parts.clear();
 		attached = null;
-		int pos = start;
+		attachedLoaded = false;
+
+		long length = entity.length();
+		long bodyStart = length;
 		StringBuilder current = null;
 		StringBuilder raw = null;
 		boolean firstLine = true;
-		while (pos < end) {
-			int lineEnd = indexOf(data, (byte) '\n', pos, end);
-			int next = lineEnd < 0 ? end : lineEnd + 1;
-			int contentEnd = lineEnd < 0 ? end : lineEnd;
-			if (contentEnd > pos && data[contentEnd - 1] == '\r') {
-				contentEnd--;
+		long headerBytes = 0;
+		int prefix = (int) Math.min(MAX_HEADER_LINE, length + 1);
+		try (LineScanner sc = new LineScanner(entity, 0, prefix)) {
+			while (sc.next()) {
+				if (sc.isBlank()) { // blank line: end of headers
+					bodyStart = sc.lineEnd;
+					break;
+				}
+				headerBytes += sc.lineEnd - sc.lineStart;
+				if (sc.truncated || headerBytes > MAX_HEADER_BYTES) {
+					bodyStart = sc.lineStart;
+					break;
+				}
+				String line = decodeHeaderLine(sc.prefix, 0, sc.prefixLen);
+				if (!utf8Headers && isUtf8(sc.prefix, 0, sc.prefixLen)) {
+					utf8Headers = true; // keep the message's RFC 6532 style when it is written
+				}
+				if ((line.charAt(0) == ' ' || line.charAt(0) == '\t') && current != null) {
+					current.append(line); // unfold: the line break is removed, the whitespace kept
+					raw.append(CRLF).append(line);
+				} else if (line.indexOf(':') > 0 && isFieldName(line.substring(0, line.indexOf(':')).trim())) {
+					addParsedHeader(current, raw);
+					current = new StringBuilder(line);
+					raw = new StringBuilder(line);
+				} else if (firstLine && topLevel && line.startsWith("From ")) {
+					// mbox separator line: not part of the message
+				} else {
+					// not a header: the headers are missing their blank line, the body starts here
+					bodyStart = sc.lineStart;
+					break;
+				}
+				firstLine = false;
+				bodyStart = length;
 			}
-			if (contentEnd == pos) { // blank line: end of headers
-				pos = next;
-				break;
-			}
-			String line = decodeHeaderLine(data, pos, contentEnd);
-			if (!utf8Headers && isUtf8(data, pos, contentEnd)) {
-				utf8Headers = true; // keep the message's RFC 6532 style when it is written
-			}
-			if ((line.charAt(0) == ' ' || line.charAt(0) == '\t') && current != null) {
-				current.append(line); // unfold: the line break is removed, the whitespace kept
-				raw.append(CRLF).append(line);
-			} else if (line.indexOf(':') > 0 && isFieldName(line.substring(0, line.indexOf(':')).trim())) {
-				addParsedHeader(current, raw);
-				current = new StringBuilder(line);
-				raw = new StringBuilder(line);
-			} else if (firstLine && topLevel && line.startsWith("From ")) {
-				// mbox separator line: not part of the message
-			} else {
-				// not a header: the headers are missing their blank line, the body starts here
-				break;
-			}
-			firstLine = false;
-			pos = next;
 		}
 		addParsedHeader(current, raw);
 
-		body = copy(data, pos, end);
+		body = entity.slice(bodyStart, length - bodyStart);
+		source = entity;
+		headerLength = bodyStart;
 		preamble = null;
-		epilogue = new byte[0];
+		epilogue = Body.EMPTY;
 		if (depth >= MAX_DEPTH) {
 			return;
 		}
@@ -175,38 +256,6 @@ public class Message implements Serializable {
 			if (boundary != null && !boundary.isEmpty()) {
 				splitMultipart(boundary, depth);
 			}
-		} else if (isAttachedMessageType()) {
-			try {
-				Message m = new Message();
-				byte[] content = getContent();
-				m.load(content, 0, content.length, true, depth + 1);
-				attached = m;
-			} catch (RuntimeException e) {
-				attached = null; // e.g. corrupt base64: keep the body as it is
-			}
-		}
-	}
-
-	private boolean isAttachedMessageType() {
-		String t = getMimeType();
-		return t.equals("message/rfc822") || t.equals("message/global");
-	}
-
-	/** True if the bytes contain non-ASCII and are valid UTF-8. */
-	private static boolean isUtf8(byte[] data, int start, int end) {
-		boolean nonAscii = false;
-		for (int i = start; i < end && !nonAscii; i++) {
-			nonAscii = data[i] < 0;
-		}
-		if (!nonAscii) {
-			return false;
-		}
-		try {
-			StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
-					.onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(data, start, end - start));
-			return true;
-		} catch (CharacterCodingException e) {
-			return false;
 		}
 	}
 
@@ -251,6 +300,24 @@ public class Message implements Serializable {
 		}
 	}
 
+	/** True if the bytes contain non-ASCII and are valid UTF-8. */
+	private static boolean isUtf8(byte[] data, int start, int end) {
+		boolean nonAscii = false;
+		for (int i = start; i < end && !nonAscii; i++) {
+			nonAscii = data[i] < 0;
+		}
+		if (!nonAscii) {
+			return false;
+		}
+		try {
+			StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
+					.onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(data, start, end - start));
+			return true;
+		} catch (CharacterCodingException e) {
+			return false;
+		}
+	}
+
 	private static boolean isFieldName(String name) {
 		if (name.isEmpty()) {
 			return false;
@@ -264,76 +331,66 @@ public class Message implements Serializable {
 		return true;
 	}
 
-	private void splitMultipart(String boundary, int depth) {
-		byte[] data = body;
+	private void splitMultipart(String boundary, int depth) throws IOException {
+		Body data = body;
 		byte[] delim = ("--" + boundary).getBytes(StandardCharsets.ISO_8859_1);
 
-		List<int[]> found = new ArrayList<>(); // {lineStart, lineEnd, isClose}
-		int ls = 0;
-		while (ls < data.length) {
-			if (startsWith(data, ls, delim)) {
-				int p = ls + delim.length;
-				boolean close = p + 1 < data.length && data[p] == '-' && data[p + 1] == '-';
-				if (close) {
-					p += 2;
-				}
-				// the rest of the line may only be whitespace
-				int q = p;
-				while (q < data.length && (data[q] == ' ' || data[q] == '\t' || data[q] == '\r')) {
-					q++;
-				}
-				if (q >= data.length || data[q] == '\n') {
-					boolean newline = q < data.length;
-					found.add(new int[] {ls, newline ? q + 1 : data.length, close ? 1 : 0, newline ? 1 : 0});
+		// {lineStart, lineEnd, isClose, hasNewline, length of the line break before it}
+		List<long[]> found = new ArrayList<>();
+		long prevBreak = 0;
+		try (LineScanner sc = new LineScanner(data, 0, delim.length + 2 + 128)) {
+			while (sc.next()) {
+				if (!sc.truncated && startsWith(sc.prefix, sc.prefixLen, delim)) {
+					int p = delim.length;
+					boolean close = p + 1 < sc.prefixLen && sc.prefix[p] == '-' && sc.prefix[p + 1] == '-';
 					if (close) {
-						break;
+						p += 2;
+					}
+					// the rest of the line may only be whitespace
+					boolean delimiter = true;
+					for (int q = p; q < sc.prefixLen && delimiter; q++) {
+						byte c = sc.prefix[q];
+						delimiter = c == ' ' || c == '\t' || c == '\r';
+					}
+					if (delimiter) {
+						found.add(new long[] {sc.lineStart, sc.lineEnd, close ? 1 : 0, sc.newline ? 1 : 0, prevBreak});
+						if (close) {
+							break;
+						}
 					}
 				}
+				prevBreak = sc.lineEnd - sc.contentEnd;
 			}
-			int nl = indexOf(data, (byte) '\n', ls, data.length);
-			if (nl < 0) {
-				break;
-			}
-			ls = nl + 1;
 		}
 		if (found.isEmpty()) {
 			return; // not really multipart: keep the body as it is
 		}
 
-		int first = found.get(0)[0];
-		preamble = first == 0 ? null : copy(data, 0, endBeforeDelimiter(data, first));
+		long length = data.length();
+		long[] first = found.get(0);
+		preamble = first[0] == 0 ? null : data.slice(0, first[0] - first[4]);
 		for (int i = 0; i < found.size(); i++) {
-			int[] d = found.get(i);
+			long[] d = found.get(i);
 			if (d[2] == 1) {
 				break;
 			}
-			int start = d[1];
-			int end = i + 1 < found.size() ? endBeforeDelimiter(data, found.get(i + 1)[0]) : data.length;
+			long start = d[1];
+			// the line break before a delimiter belongs to the delimiter
+			long end = i + 1 < found.size() ? found.get(i + 1)[0] - found.get(i + 1)[4] : length;
 			Message p = new Message();
 			p.part = true;
-			p.load(data, start, Math.max(start, end), false, depth + 1);
+			p.workDirectory = workDirectory;
+			p.load(data.slice(start, Math.max(0, end - start)), false, depth + 1);
 			parts.add(p);
 		}
-		int[] last = found.get(found.size() - 1);
+		long[] last = found.get(found.size() - 1);
 		if (last[2] == 1) {
 			// null epilogue = the closing delimiter line had no line break
-			epilogue = last[3] == 1 ? copy(data, last[1], data.length) : null;
+			epilogue = last[3] == 1 ? data.slice(last[1], length - last[1]) : null;
 		} else {
 			epilogue = null; // no closing delimiter; one is written on output
 		}
 		body = null;
-	}
-
-	/** The CRLF (or LF) before a delimiter line belongs to the delimiter. */
-	private static int endBeforeDelimiter(byte[] data, int lineStart) {
-		int e = lineStart;
-		if (e > 0 && data[e - 1] == '\n') {
-			e--;
-			if (e > 0 && data[e - 1] == '\r') {
-				e--;
-			}
-		}
-		return e;
 	}
 
 	// ------------------------------------------------------------------ writing
@@ -346,10 +403,65 @@ public class Message implements Serializable {
 		write(out, utf8Headers);
 	}
 
+	/**
+	 * Write the message to a file. Writing to the file the message was parsed from
+	 * is allowed: the message is written to a temp file beside it, which then
+	 * replaces it, and the message is re-read from it. Parts obtained before the
+	 * call must be fetched again afterwards.
+	 */
+	public void writeTo(FileSource dest) throws IOException {
+		if (!usesFile(dest)) {
+			try (OutputStream out = output(dest)) {
+				writeTo(out);
+			}
+			return;
+		}
+		FileSource dir = dest.getParentFile();
+		FileSource tmp = dir.getFileSourceFactory().createTempFile("bjlmsg", ".tmp", dir);
+		try (OutputStream out = output(tmp)) {
+			writeTo(out);
+		} catch (IOException | RuntimeException e) {
+			tmp.delete();
+			throw e;
+		}
+		List<FileSource> obsolete = new ArrayList<>();
+		collectOwned(obsolete);
+		if (!dest.delete()) {
+			tmp.delete();
+			throw new IOException("Could not replace " + dest.getAbsolutePath());
+		}
+		if (!tmp.renameTo(dest)) {
+			throw new IOException("Could not rename " + tmp.getAbsolutePath() + " to " + dest.getAbsolutePath()
+					+ "; the message is in " + tmp.getAbsolutePath());
+		}
+		boolean utf8 = utf8Headers;
+		load(Body.of(dest), !part, depth);
+		utf8Headers = utf8;
+		// the old temp files are no longer used (except dest itself, if this message owns it)
+		for (FileSource f : obsolete) {
+			if (!sameFile(f, dest)) {
+				f.delete();
+				ownedFiles.remove(f);
+			}
+		}
+	}
+
+	/** The whole message in memory. Only for small messages; use writeTo otherwise. */
+	public byte[] toByteArray() {
+		ByteArrayOutputStream out = new ByteArrayOutputStream();
+		try {
+			writeTo(out);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+		return out.toByteArray();
+	}
+
 	private void write(OutputStream out, boolean utf8) throws IOException {
+		String attachedEncoding = planAttached();
 		writeHeaders(out, utf8);
 		out.write(CRLF_BYTES);
-		writeBody(out, utf8);
+		writeBody(out, utf8, attachedEncoding);
 	}
 
 	private void writeHeaders(OutputStream out, boolean utf8) throws IOException {
@@ -360,6 +472,49 @@ public class Message implements Serializable {
 			}
 			out.write(text.getBytes(StandardCharsets.UTF_8));
 			out.write(CRLF_BYTES);
+		}
+	}
+
+	private void writeBody(OutputStream out, boolean utf8, String attachedEncoding) throws IOException {
+		if (parts.isEmpty()) {
+			if (attachedEncoding != null) {
+				writeAttached(out, attachedEncoding);
+			} else if (body != null) {
+				copyBody(body, out, "binary".equals(getTransferEncoding()));
+			}
+			return;
+		}
+		String boundary = ensureBoundary();
+		byte[] delim = ("--" + boundary).getBytes(StandardCharsets.ISO_8859_1);
+		if (preamble != null) {
+			copyBody(preamble, out, false);
+			out.write(CRLF_BYTES);
+		}
+		for (Message p : parts) {
+			out.write(delim);
+			out.write(CRLF_BYTES);
+			p.write(out, utf8);
+			out.write(CRLF_BYTES);
+		}
+		out.write(delim);
+		out.write('-');
+		out.write('-');
+		if (epilogue != null) {
+			out.write(CRLF_BYTES);
+			copyBody(epilogue, out, false);
+		}
+	}
+
+	/** Copy a body, turning bare LF into CRLF unless it is binary. */
+	private static void copyBody(Body b, OutputStream out, boolean binary) throws IOException {
+		try (InputStream in = b.open()) {
+			if (binary) {
+				Streams.copy(in, out);
+			} else {
+				Streams.CrlfOutputStream crlf = new Streams.CrlfOutputStream(out);
+				Streams.copy(in, crlf);
+				crlf.flush();
+			}
 		}
 	}
 
@@ -429,65 +584,6 @@ public class Message implements Serializable {
 		return max;
 	}
 
-	public byte[] toByteArray() {
-		ByteArrayOutputStream out = new ByteArrayOutputStream();
-		try {
-			writeTo(out);
-		} catch (IOException e) {
-			throw new IllegalStateException(e); // can't happen with a ByteArrayOutputStream
-		}
-		return out.toByteArray();
-	}
-
-	private void writeBody(OutputStream out, boolean utf8) throws IOException {
-		if (parts.isEmpty()) {
-			byte[] b = body;
-			if (attached != null && b != null) {
-				b = attachedBody();
-			}
-			if (b != null) {
-				if ("binary".equals(getTransferEncoding())) {
-					out.write(b);
-				} else {
-					writeWithCrlf(out, b);
-				}
-			}
-			return;
-		}
-		String boundary = ensureBoundary();
-		byte[] delim = ("--" + boundary).getBytes(StandardCharsets.ISO_8859_1);
-		if (preamble != null) {
-			writeWithCrlf(out, preamble);
-			out.write(CRLF_BYTES);
-		}
-		for (Message p : parts) {
-			out.write(delim);
-			out.write(CRLF_BYTES);
-			p.write(out, utf8);
-			out.write(CRLF_BYTES);
-		}
-		out.write(delim);
-		out.write('-');
-		out.write('-');
-		if (epilogue != null) {
-			out.write(CRLF_BYTES);
-			writeWithCrlf(out, epilogue);
-		}
-	}
-
-	/** Write bytes, turning bare LF into CRLF. */
-	private static void writeWithCrlf(OutputStream out, byte[] data) throws IOException {
-		int from = 0;
-		for (int i = 0; i < data.length; i++) {
-			if (data[i] == '\n' && (i == 0 || data[i - 1] != '\r')) {
-				out.write(data, from, i - from);
-				out.write('\r');
-				from = i; // the '\n' is written with the next chunk
-			}
-		}
-		out.write(data, from, data.length - from);
-	}
-
 	/**
 	 * Fold a header line at whitespace so lines are at most 78 octets (UTF-8 bytes)
 	 * where possible (RFC 5322 section 2.2.3, RFC 6532). A run of text without
@@ -544,6 +640,7 @@ public class Message implements Serializable {
 		return c == ' ' || c == '\t';
 	}
 
+	/** The whole message as text. Only for small messages. */
 	@Override
 	public String toString() {
 		return new String(toByteArray(), StandardCharsets.UTF_8);
@@ -743,16 +840,17 @@ public class Message implements Serializable {
 		return name;
 	}
 
-	/** True if Content-Disposition is "attachment", or the part has a file name and isn't inline. */
+	/**
+	 * True if Content-Disposition is "attachment"; or the part is an attached
+	 * message or has a file name, and isn't marked inline.
+	 */
 	public boolean isAttachment() {
 		MimeHeaderValue cd = getContentDisposition();
 		if (cd != null && cd.getValue().equalsIgnoreCase("attachment")) {
 			return true;
 		}
-		if (isAttachedMessageType() && (cd == null || !cd.getValue().equalsIgnoreCase("inline"))) {
-			return true;
-		}
-		return (cd == null || !cd.getValue().equalsIgnoreCase("inline")) && getFilename() != null;
+		boolean inline = cd != null && cd.getValue().equalsIgnoreCase("inline");
+		return !inline && (isAttachedMessageType() || getFilename() != null);
 	}
 
 	/** The Content-Transfer-Encoding in lower case; "7bit" when there is none. */
@@ -761,48 +859,136 @@ public class Message implements Serializable {
 		return cte == null || cte.trim().isEmpty() ? "7bit" : cte.trim().toLowerCase(Locale.ROOT);
 	}
 
-	/** The body exactly as transferred (still transfer-encoded); null for a message with parts. */
+	/** The size of the body as transferred, in bytes; -1 for a message with parts. */
+	public long getBodyLength() throws IOException {
+		materializeAttached();
+		return parts.isEmpty() && body != null ? body.length() : -1;
+	}
+
+	/**
+	 * The body exactly as transferred (still transfer-encoded), as a stream; null
+	 * for a message with parts. The caller closes it.
+	 */
+	public InputStream openBody() throws IOException {
+		materializeAttached();
+		return parts.isEmpty() && body != null ? body.open() : null;
+	}
+
+	/**
+	 * The body exactly as transferred, in memory; null for a message with parts.
+	 * Only for small bodies; use {@link #openBody()} otherwise.
+	 */
 	public byte[] getBody() {
-		return body;
+		try {
+			materializeAttached();
+			return parts.isEmpty() && body != null ? body.toByteArray() : null;
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
 	}
 
 	/** Set the body as transferred; it must already match Content-Transfer-Encoding. Removes any parts. */
 	public Message setBody(byte[] body) {
-		this.body = body == null ? new byte[0] : body;
+		return setBody(Body.of(body == null ? new byte[0] : body));
+	}
+
+	/**
+	 * Use a file as the body, as transferred (it must already match
+	 * Content-Transfer-Encoding). The file is read when the message is written, so
+	 * it must stay unchanged until then. Removes any parts.
+	 */
+	public Message setBody(FileSource file) throws IOException {
+		return setBody(Body.of(file));
+	}
+
+	private Message setBody(Body b) {
+		this.body = b;
 		attached = null;
+		attachedLoaded = false;
 		parts.clear();
 		preamble = null;
-		epilogue = new byte[0];
+		epilogue = Body.EMPTY;
 		return this;
 	}
 
 	/**
-	 * The body with its transfer encoding (base64 or quoted-printable) removed.
-	 * For a multipart message, the raw multipart body.
+	 * The content with its transfer encoding (base64 or quoted-printable) removed,
+	 * as a stream; for a multipart message, the multipart body. The caller closes it.
+	 */
+	public InputStream openContent() throws IOException {
+		if (!parts.isEmpty()) {
+			if (isInMemory()) {
+				ByteArrayOutputStream out = new ByteArrayOutputStream();
+				writeBody(out, utf8Headers, null);
+				return new ByteArrayInputStream(out.toByteArray());
+			}
+			FileSource f = createTempFile();
+			try (OutputStream out = output(f)) {
+				writeBody(out, utf8Headers, null);
+			}
+			return f.getInputStream();
+		}
+		InputStream raw = openBody();
+		return raw == null ? InputStream.nullInputStream() : decode(raw, getTransferEncoding());
+	}
+
+	private static InputStream decode(InputStream raw, String cte) {
+		switch (cte) {
+		case "base64":
+			return Base64.getMimeDecoder().wrap(raw);
+		case "quoted-printable":
+			return QuotedPrintable.decoder(raw);
+		default:
+			return raw;
+		}
+	}
+
+	/** Write the decoded content to a stream, which is not closed. */
+	public void writeContentTo(OutputStream out) throws IOException {
+		try (InputStream in = openContent()) {
+			Streams.copy(in, out);
+		}
+	}
+
+	/** Write the decoded content (e.g. an attachment) to a file. */
+	public void saveContent(FileSource dest) throws IOException {
+		try (OutputStream out = output(dest)) {
+			writeContentTo(out);
+		}
+	}
+
+	/**
+	 * The decoded content in memory; for a multipart message, the multipart body.
+	 * Only for small content; use {@link #openContent()} otherwise.
+	 *
+	 * @throws UncheckedIOException if the content can't be read or decoded
 	 */
 	public byte[] getContent() {
-		if (!parts.isEmpty()) {
-			ByteArrayOutputStream out = new ByteArrayOutputStream();
-			try {
-				writeBody(out, utf8Headers);
-			} catch (IOException e) {
-				throw new IllegalStateException(e);
+		try {
+			if (!parts.isEmpty()) {
+				ByteArrayOutputStream out = new ByteArrayOutputStream();
+				writeBody(out, utf8Headers, null);
+				return out.toByteArray();
 			}
-			return out.toByteArray();
-		}
-		switch (getTransferEncoding()) {
-		case "base64":
-			return Base64.getMimeDecoder().decode(body);
-		case "quoted-printable":
-			return QuotedPrintable.decode(body);
-		default:
-			return body.clone();
+			materializeAttached();
+			if (body == null) {
+				return new byte[0];
+			}
+			if (body.length() > Body.MAX_ARRAY) {
+				throw new IOException("Too large to load into memory: " + body.length() + " bytes; use openContent()");
+			}
+			try (InputStream in = openContent()) {
+				return in.readAllBytes();
+			}
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
 		}
 	}
 
 	/**
 	 * The content as text, decoded with the Content-Type charset (UTF-8 when there
 	 * is none; ISO-8859-1 when the charset is unknown, so no bytes are lost).
+	 * Only for small content.
 	 */
 	public String getText() {
 		String name = getContentType().getParameter("charset");
@@ -836,8 +1022,9 @@ public class Message implements Serializable {
 	}
 
 	/**
-	 * Set content of any type. Text types get CRLF line breaks and are sent as 7bit
-	 * when they are ASCII, quoted-printable otherwise; everything else as base64.
+	 * Set content of any type from memory. Text types get CRLF line breaks and are
+	 * sent as 7bit when they are ASCII, quoted-printable otherwise; everything else
+	 * as base64.
 	 *
 	 * @param contentType e.g. "application/pdf" or "text/csv; charset=UTF-8"
 	 */
@@ -846,31 +1033,66 @@ public class Message implements Serializable {
 		byte[] bytes = data == null ? new byte[0] : data;
 		boolean text = ct.getValue().toLowerCase(Locale.ROOT).startsWith("text/");
 		if (text) {
-			bytes = toCrlf(bytes); // canonical form for text (RFC 2049)
+			ByteArrayOutputStream out = new ByteArrayOutputStream(bytes.length + 16);
+			try (OutputStream c = new Streams.CanonicalTextOutputStream(out)) {
+				c.write(bytes); // canonical form for text (RFC 2049)
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
+			}
+			bytes = out.toByteArray();
 		}
 		setEncodedContent(bytes, ct, text);
 		return this;
 	}
 
-	/** Turn bare LF and bare CR into CRLF. */
-	private static byte[] toCrlf(byte[] data) {
-		ByteArrayOutputStream out = new ByteArrayOutputStream(data.length + 16);
-		for (int i = 0; i < data.length; i++) {
-			byte b = data[i];
-			if (b == '\r') {
-				out.write('\r');
-				out.write('\n');
-				if (i + 1 < data.length && data[i + 1] == '\n') {
-					i++;
+	/**
+	 * Set content of any size from a file, encoded the same way as
+	 * {@link #setContent(byte[], String)}. The encoded content is streamed into a
+	 * temp file in the work directory (deleted by {@link #close()}); the source
+	 * file is only read during this call.
+	 */
+	public Message setContent(FileSource data, String contentType) throws IOException {
+		MimeHeaderValue ct = MimeHeaderValue.parse(contentType);
+		boolean text = ct.getValue().toLowerCase(Locale.ROOT).startsWith("text/");
+		FileSource encoded = createTempFile();
+		String cte;
+		if (text) {
+			Streams.StatsOutputStream stats = new Streams.StatsOutputStream();
+			try (InputStream in = data.getInputStream(); OutputStream c = new Streams.CanonicalTextOutputStream(stats)) {
+				Streams.copy(in, c);
+			}
+			cte = stats.is7bit() ? "7bit" : "quoted-printable";
+			try (InputStream in = data.getInputStream(); OutputStream file = output(encoded);
+					OutputStream c = new Streams.CanonicalTextOutputStream(
+							stats.is7bit() ? Streams.noClose(file) : QuotedPrintable.encoder(Streams.noClose(file), true))) {
+				Streams.copy(in, c);
+			}
+		} else {
+			cte = "base64";
+			try (InputStream in = data.getInputStream(); OutputStream file = output(encoded)) {
+				OutputStream b64 = Base64.getMimeEncoder(76, CRLF_BYTES).wrap(Streams.noClose(file));
+				long n;
+				try {
+					byte[] buf = new byte[57 * 1024];
+					n = 0;
+					int r;
+					while ((r = in.read(buf)) > 0) {
+						b64.write(buf, 0, r);
+						n += r;
+					}
+				} finally {
+					b64.close();
 				}
-			} else if (b == '\n') {
-				out.write('\r');
-				out.write('\n');
-			} else {
-				out.write(b);
+				if (n > 0) {
+					file.write(CRLF_BYTES);
+				}
 			}
 		}
-		return out.toByteArray();
+		setContentType(ct);
+		setHeader("Content-Transfer-Encoding", cte);
+		setBody(Body.of(encoded));
+		ensureMimeVersion();
+		return this;
 	}
 
 	private void setEncodedContent(byte[] data, MimeHeaderValue ct, boolean text) {
@@ -897,19 +1119,10 @@ public class Message implements Serializable {
 
 	/** ASCII, no NUL, no bare CR or LF, and no line longer than 998 characters. */
 	private static boolean is7bit(byte[] data) {
-		int col = 0;
-		for (int i = 0; i < data.length; i++) {
-			int b = data[i] & 0xff;
-			if (b == '\r' && i + 1 < data.length && data[i + 1] == '\n') {
-				col = 0;
-				i++;
-				continue;
-			}
-			if (b >= 128 || b == 0 || b == '\r' || b == '\n' || ++col > MAX_LINE) {
-				return false;
-			}
-		}
-		return true;
+		Streams.StatsOutputStream s = new Streams.StatsOutputStream();
+		s.write(data, 0, data.length);
+		s.close();
+		return s.is7bit();
 	}
 
 	private void ensureMimeVersion() {
@@ -935,6 +1148,9 @@ public class Message implements Serializable {
 		}
 		p.part = true;
 		p.removeHeader("MIME-Version");
+		if (p.workDirectory == null) {
+			p.workDirectory = workDirectory;
+		}
 		parts.add(p);
 		body = null;
 		return this;
@@ -946,17 +1162,43 @@ public class Message implements Serializable {
 	}
 
 	/**
-	 * Add an attachment. The file name is written in both Content-Disposition
-	 * filename and Content-Type name, RFC 2231-encoded when it isn't plain ASCII.
-	 * If this message isn't multipart/mixed it becomes one, with the existing
-	 * content as the first part.
+	 * Add an attachment from memory. The file name is written in both
+	 * Content-Disposition filename and Content-Type name, RFC 2231-encoded when it
+	 * isn't plain ASCII. If this message isn't multipart/mixed it becomes one, with
+	 * the existing content as the first part.
 	 *
 	 * @return the new attachment part
 	 */
 	public Message addAttachment(String filename, String contentType, byte[] data) {
+		Message att = newPart();
+		att.setContent(data, contentType);
+		return addAttachmentPart(att, filename);
+	}
+
+	/**
+	 * Add an attachment of any size from a file; see {@link #setContent(FileSource, String)}.
+	 *
+	 * @return the new attachment part
+	 */
+	public Message addAttachment(String filename, String contentType, FileSource data) throws IOException {
+		Message att = newPart();
+		att.setContent(data, contentType);
+		return addAttachmentPart(att, filename);
+	}
+
+	/** Add a file as an attachment under its own name. */
+	public Message addAttachment(FileSource data, String contentType) throws IOException {
+		return addAttachment(data.getName(), contentType, data);
+	}
+
+	private Message newPart() {
 		Message att = new Message();
 		att.part = true;
-		att.setContent(data, contentType);
+		att.workDirectory = workDirectory;
+		return att;
+	}
+
+	private Message addAttachmentPart(Message att, String filename) {
 		if (filename != null) {
 			att.setContentType(att.getContentType().setParameter("name", filename));
 		}
@@ -995,10 +1237,15 @@ public class Message implements Serializable {
 	 * body move into a first part, unless there is no content yet.
 	 */
 	private void makeMultipart(String subtype) {
-		boolean hasContent = (body != null && body.length > 0) || !parts.isEmpty() || getHeader("Content-Type") != null;
+		boolean hasContent;
+		try {
+			hasContent = (body != null && body.length() > 0) || !parts.isEmpty() || attached != null
+					|| getHeader("Content-Type") != null;
+		} catch (IOException e) {
+			hasContent = true;
+		}
 		if (hasContent) {
-			Message first = new Message();
-			first.part = true;
+			Message first = newPart();
 			for (Iterator<Header> it = headers.iterator(); it.hasNext();) {
 				Header h = it.next();
 				if (h.getName().toLowerCase(Locale.ROOT).startsWith("content-")) {
@@ -1008,9 +1255,11 @@ public class Message implements Serializable {
 			}
 			first.body = body;
 			first.attached = attached;
+			first.attachedLoaded = attachedLoaded;
 			first.parts.addAll(parts);
 			first.preamble = preamble;
 			first.epilogue = epilogue;
+			first.depth = depth + 1;
 			parts.clear();
 			parts.add(first);
 		} else {
@@ -1018,8 +1267,9 @@ public class Message implements Serializable {
 		}
 		body = null;
 		attached = null;
+		attachedLoaded = false;
 		preamble = null;
-		epilogue = new byte[0];
+		epilogue = Body.EMPTY;
 		setContentType(new MimeHeaderValue("multipart/" + subtype).setParameter("boundary", newBoundary()));
 		ensureMimeVersion();
 	}
@@ -1049,6 +1299,30 @@ public class Message implements Serializable {
 			sb.append(Character.forDigit((b >> 4) & 0xf, 16)).append(Character.forDigit(b & 0xf, 16));
 		}
 		return sb.toString();
+	}
+
+	public byte[] getPreamble() {
+		try {
+			return preamble == null ? null : preamble.toByteArray();
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+	}
+
+	public void setPreamble(byte[] preamble) {
+		this.preamble = preamble == null ? null : Body.of(preamble);
+	}
+
+	public byte[] getEpilogue() {
+		try {
+			return epilogue == null ? null : epilogue.toByteArray();
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+	}
+
+	public void setEpilogue(byte[] epilogue) {
+		this.epilogue = epilogue == null ? null : Body.of(epilogue);
 	}
 
 	// ------------------------------------------------------------------ RFC 6532
@@ -1083,7 +1357,7 @@ public class Message implements Serializable {
 		try {
 			writeHeaders(out, utf8);
 		} catch (IOException e) {
-			throw new IllegalStateException(e);
+			throw new UncheckedIOException(e);
 		}
 		for (byte b : out.toByteArray()) {
 			if (b < 0) {
@@ -1098,11 +1372,50 @@ public class Message implements Serializable {
 		return false;
 	}
 
+	private boolean isAttachedMessageType() {
+		String t = getMimeType();
+		return t.equals("message/rfc822") || t.equals("message/global");
+	}
+
+	private static boolean isIdentityEncoding(String cte) {
+		return cte.equals("7bit") || cte.equals("8bit") || cte.equals("binary");
+	}
+
 	/**
-	 * For a message/rfc822 or message/global part: the attached message, parsed.
-	 * Changes to it are written out with this part. Null for other parts.
+	 * For a message/rfc822 or message/global part: the attached message, parsed on
+	 * first use (a base64 or quoted-printable one is decoded into a temp file).
+	 * Changes to it are written out with this part. Null for other parts or if it
+	 * can't be read.
 	 */
 	public Message getAttachedMessage() {
+		if (!attachedLoaded) {
+			attachedLoaded = true;
+			if (parts.isEmpty() && body != null && isAttachedMessageType() && depth < MAX_DEPTH) {
+				try {
+					String cte = getTransferEncoding();
+					Body content;
+					if (isIdentityEncoding(cte)) {
+						content = body;
+					} else if (body.getFile() == null) {
+						try (InputStream in = decode(body.open(), cte)) {
+							content = Body.of(in.readAllBytes());
+						}
+					} else {
+						FileSource f = createTempFile();
+						try (InputStream in = decode(body.open(), cte); OutputStream out = output(f)) {
+							Streams.copy(in, out);
+						}
+						content = Body.of(f);
+					}
+					Message m = new Message();
+					m.workDirectory = workDirectory;
+					m.load(content, true, depth + 1);
+					attached = m;
+				} catch (IOException | RuntimeException e) {
+					attached = null;
+				}
+			}
+		}
 		return attached;
 	}
 
@@ -1113,14 +1426,18 @@ public class Message implements Serializable {
 	 * @return the new part
 	 */
 	public Message attachMessage(Message message) {
-		Message p = new Message();
-		p.part = true;
+		Message p = newPart();
 		p.setHeader("Content-Type", message.needsSmtpUtf8() ? "message/global" : "message/rfc822");
 		p.setHeader("Content-Transfer-Encoding", "7bit");
 		p.setHeader("Content-Disposition", "attachment");
 		p.attached = message;
-		p.body = new byte[0];
-		p.body = p.attachedBody();
+		p.attachedLoaded = true;
+		p.body = null;
+		try {
+			p.planAttached(); // sets Content-Transfer-Encoding
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
 		if (!getMimeType().equals("multipart/mixed")) {
 			makeMultipart("mixed");
 		}
@@ -1129,103 +1446,256 @@ public class Message implements Serializable {
 	}
 
 	/**
-	 * The body for an attached message: the original bytes while the message is
-	 * unchanged, otherwise the message re-written and transfer-encoded.
+	 * If this part holds an attached message that differs from the stored body,
+	 * choose its transfer encoding (setting the header) and return it; otherwise null.
 	 */
-	private byte[] attachedBody() {
-		byte[] now = attached.toByteArray();
-		byte[] before;
-		try {
-			before = getContent();
-		} catch (RuntimeException e) {
-			before = null;
+	private String planAttached() throws IOException {
+		if (attached == null || !parts.isEmpty()) {
+			return null;
 		}
-		if (Arrays.equals(now, before)) {
-			return body;
+		if (body != null && attachedUnchanged()) {
+			return null;
 		}
 		String cte = getTransferEncoding();
-		boolean global = getMimeType().equals("message/global");
-		if (cte.equals("7bit") || cte.equals("8bit")) {
-			// pick the lightest encoding the new content allows
-			if (is7bit(now)) {
-				cte = "7bit";
-			} else if (is8bit(now)) {
-				cte = "8bit";
-			} else {
-				cte = global ? "base64" : "binary"; // message/rfc822 may not be base64 (RFC 2046)
-			}
+		if (isIdentityEncoding(cte)) {
+			// the lightest encoding the content allows
+			Streams.StatsOutputStream stats = new Streams.StatsOutputStream();
+			attached.writeTo(stats);
+			stats.close();
+			boolean global = getMimeType().equals("message/global");
+			cte = stats.is7bit() ? "7bit" : stats.is8bit() ? "8bit" : global ? "base64" : "binary";
 			setHeader("Content-Transfer-Encoding", cte);
 		}
+		return cte;
+	}
+
+	/** Streams the attached message against the decoded stored body. */
+	private boolean attachedUnchanged() {
+		try (InputStream expected = decode(body.open(), getTransferEncoding())) {
+			Streams.ComparingOutputStream cmp = new Streams.ComparingOutputStream(expected);
+			attached.writeTo(cmp);
+			return cmp.matches();
+		} catch (IOException | RuntimeException e) {
+			return false;
+		}
+	}
+
+	private void writeAttached(OutputStream out, String cte) throws IOException {
 		switch (cte) {
-		case "base64":
-			return concat(Base64.getMimeEncoder(76, CRLF_BYTES).encode(now), CRLF_BYTES);
-		case "quoted-printable":
-			return QuotedPrintable.encode(now, true);
+		case "base64": {
+			OutputStream enc = Base64.getMimeEncoder(76, CRLF_BYTES).wrap(Streams.noClose(out));
+			attached.writeTo(enc);
+			enc.close();
+			out.write(CRLF_BYTES);
+			break;
+		}
+		case "quoted-printable": {
+			OutputStream enc = QuotedPrintable.encoder(Streams.noClose(out), true);
+			attached.writeTo(enc);
+			enc.close();
+			break;
+		}
 		default:
-			return now;
+			attached.writeTo(out);
 		}
 	}
 
-	/** Like 7bit, but bytes over 127 are allowed. */
-	private static boolean is8bit(byte[] data) {
-		int col = 0;
-		for (int i = 0; i < data.length; i++) {
-			int b = data[i] & 0xff;
-			if (b == '\r' && i + 1 < data.length && data[i + 1] == '\n') {
-				col = 0;
-				i++;
-				continue;
-			}
-			if (b == 0 || b == '\r' || b == '\n' || ++col > MAX_LINE) {
-				return false;
+	/** Make the stored body match a changed attached message (into a temp file). */
+	private void materializeAttached() throws IOException {
+		String cte = planAttached();
+		if (cte == null) {
+			return;
+		}
+		if (isInMemory()) {
+			ByteArrayOutputStream out = new ByteArrayOutputStream();
+			writeAttached(out, cte);
+			body = Body.of(out.toByteArray());
+			return;
+		}
+		FileSource f = createTempFile();
+		try (OutputStream out = output(f)) {
+			writeAttached(out, cte);
+		}
+		body = Body.of(f);
+	}
+
+	/** True if nothing in this message is stored in a file (it was built or parsed in memory). */
+	private boolean isInMemory() {
+		List<FileSource> files = new ArrayList<>();
+		collectFiles(files);
+		return files.isEmpty();
+	}
+
+	private static OutputStream output(FileSource f) throws IOException {
+		return new BufferedOutputStream(f.getOutputStream(), 64 * 1024);
+	}
+
+	// ------------------------------------------------------------------ as parsed
+
+	/**
+	 * For a message or part read by parse() or read(): its size as stored, headers
+	 * and body; -1 for one that was built rather than parsed. This describes the
+	 * stored bytes, so it doesn't reflect later changes to the message.
+	 */
+	public long getSourceLength() throws IOException {
+		return source == null ? -1 : source.length();
+	}
+
+	/**
+	 * For a parsed message or part: the length of its header block as stored,
+	 * including the blank line that ends it; -1 if it wasn't parsed.
+	 */
+	public long getHeaderLength() {
+		return source == null ? -1 : headerLength;
+	}
+
+	/**
+	 * Read part of a parsed message or part exactly as stored (offsets are
+	 * relative to the start of its headers). The caller closes the stream.
+	 */
+	public InputStream openSource(long offset, long length) throws IOException {
+		if (source == null) {
+			throw new IOException("Not a parsed message");
+		}
+		return source.slice(offset, length).open();
+	}
+
+	// ------------------------------------------------------------------ storage
+
+	/**
+	 * The directory temp files are created in: this message's work directory if set,
+	 * else the default set by {@link #setDefaultWorkDirectory(FileSource)}, else the
+	 * default FileSource factory's temp directory.
+	 */
+	public FileSource getWorkDirectory() throws IOException {
+		if (workDirectory != null) {
+			return workDirectory;
+		}
+		FileSource d = defaultWorkDirectory;
+		return d != null ? d : FileSourceFactory.getDefaultFactory().getTempDirectory();
+	}
+
+	/** Set the directory temp files of this message (and parts added later) go in. */
+	public Message setWorkDirectory(FileSource dir) {
+		this.workDirectory = dir;
+		return this;
+	}
+
+	public static FileSource getDefaultWorkDirectory() {
+		return defaultWorkDirectory;
+	}
+
+	/** Set the directory temp files go in for messages without their own; null for the system default. */
+	public static void setDefaultWorkDirectory(FileSource dir) {
+		defaultWorkDirectory = dir;
+	}
+
+	private FileSource createTempFile() throws IOException {
+		FileSource dir = getWorkDirectory();
+		FileSource f = dir.getFileSourceFactory().createTempFile("bjlmsg", ".tmp", dir);
+		if (ownedFiles == null) {
+			ownedFiles = new ArrayList<>();
+		}
+		ownedFiles.add(f);
+		return f;
+	}
+
+	/**
+	 * Delete the temp files this message and its parts created (copies made by
+	 * {@link #read(InputStream)}, encoded attachments, decoded attached messages).
+	 * The file a message was parsed from with {@link #parse(FileSource)} is not
+	 * deleted. The message must not be used afterwards.
+	 */
+	@Override
+	public void close() throws IOException {
+		List<FileSource> all = new ArrayList<>();
+		collectOwned(all);
+		IOException first = null;
+		for (FileSource f : all) {
+			try {
+				f.delete();
+			} catch (IOException e) {
+				if (first == null) {
+					first = e;
+				}
 			}
 		}
-		return true;
+		clearOwned();
+		if (first != null) {
+			throw first;
+		}
 	}
 
-	public byte[] getPreamble() {
-		return preamble;
+	private void collectOwned(List<FileSource> into) {
+		if (ownedFiles != null) {
+			into.addAll(ownedFiles);
+		}
+		for (Message p : parts) {
+			p.collectOwned(into);
+		}
+		if (attached != null) {
+			attached.collectOwned(into);
+		}
 	}
 
-	public void setPreamble(byte[] preamble) {
-		this.preamble = preamble;
+	private void clearOwned() {
+		if (ownedFiles != null) {
+			ownedFiles.clear();
+		}
+		for (Message p : parts) {
+			p.clearOwned();
+		}
+		if (attached != null) {
+			attached.clearOwned();
+		}
 	}
 
-	public byte[] getEpilogue() {
-		return epilogue;
+	/** True if any body of this message (or its parts) is read from {@code file}. */
+	private boolean usesFile(FileSource file) throws IOException {
+		List<FileSource> files = new ArrayList<>();
+		collectFiles(files);
+		for (FileSource f : files) {
+			if (sameFile(f, file)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
-	public void setEpilogue(byte[] epilogue) {
-		this.epilogue = epilogue;
+	private void collectFiles(List<FileSource> into) {
+		for (Body b : new Body[] {body, preamble, epilogue}) {
+			if (b != null && b.getFile() != null) {
+				into.add(b.getFile());
+			}
+		}
+		for (Message p : parts) {
+			p.collectFiles(into);
+		}
+		if (attached != null) {
+			attached.collectFiles(into);
+		}
+	}
+
+	private static boolean sameFile(FileSource a, FileSource b) throws IOException {
+		if (a == b) {
+			return true;
+		}
+		return a.getFileSourceFactory().getClass() == b.getFileSourceFactory().getClass()
+				&& a.getCanonicalPath().equals(b.getCanonicalPath());
 	}
 
 	// ------------------------------------------------------------------ helpers
 
-	private static int indexOf(byte[] data, byte b, int from, int to) {
-		for (int i = from; i < to; i++) {
-			if (data[i] == b) {
-				return i;
-			}
-		}
-		return -1;
-	}
-
-	private static boolean startsWith(byte[] data, int at, byte[] prefix) {
-		if (at + prefix.length > data.length) {
+	private static boolean startsWith(byte[] data, int len, byte[] prefix) {
+		if (prefix.length > len) {
 			return false;
 		}
 		for (int i = 0; i < prefix.length; i++) {
-			if (data[at + i] != prefix[i]) {
+			if (data[i] != prefix[i]) {
 				return false;
 			}
 		}
 		return true;
-	}
-
-	private static byte[] copy(byte[] data, int from, int to) {
-		byte[] ret = new byte[Math.max(0, to - from)];
-		System.arraycopy(data, from, ret, 0, ret.length);
-		return ret;
 	}
 
 	private static byte[] concat(byte[] a, byte[] b) {

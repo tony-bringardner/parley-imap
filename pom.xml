@@ -5,7 +5,7 @@
 	<artifactId>bjl_email</artifactId>
 	<name>Bringardner Java Library Email</name>
 	<groupId>us.bringardner</groupId>
-	<version>0.1.0</version>
+	<version>1.0.0-SNAPSHOT</version>
 
 	<description>Email message primitives (addresses, headers, RFC 5322 dates) for the BJL Network Framework.</description>
 
@@ -78,6 +78,11 @@
 					<groupId>org.apache.maven.plugins</groupId>
 					<artifactId>maven-surefire-plugin</artifactId>
 					<version>3.5.2</version>
+					<configuration>
+						<!-- Small heap on purpose: TestLargeMessage handles a 150 MB attachment,
+						     which only passes if Message keeps bodies out of memory. -->
+						<argLine>-Xmx64m</argLine>
+					</configuration>
 				</plugin>
 			</plugins>
 		</pluginManagement>
@@ -112,12 +117,12 @@
 		<dependency>
   			<groupId>us.bringardner</groupId>
   			<artifactId>bjl_net_framework</artifactId>
-  			<version>0.1.1</version>
+  			<version>1.0.2-SNAPSHOT</version>
 		</dependency>
 		<dependency>
   			<groupId>us.bringardner</groupId>
   			<artifactId>bjl_file_system</artifactId>
-  			<version>0.1.1</version>
+  			<version>1.0.2-SNAPSHOT</version>
 		</dependency>
 
 		<dependency>

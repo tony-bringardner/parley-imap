@@ -1,10 +1,17 @@
 package us.bringardner.net.email;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.util.Arrays;
+import java.io.FilterOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.PushbackInputStream;
+import java.io.UncheckedIOException;
 
 /**
- * Quoted-printable content transfer encoding (RFC 2045 section 6.7).
+ * Quoted-printable content transfer encoding (RFC 2045 section 6.7), as streams
+ * for content of any size and as byte-array helpers for small content.
  */
 public final class QuotedPrintable {
 
@@ -22,57 +29,12 @@ public final class QuotedPrintable {
 	 */
 	public static byte[] encode(byte[] data, boolean text) {
 		ByteArrayOutputStream out = new ByteArrayOutputStream(data.length + data.length / 8 + 16);
-		int col = 0;
-		for (int i = 0; i < data.length; i++) {
-			int b = data[i] & 0xff;
-			if (text) {
-				if (b == '\r' && i + 1 < data.length && data[i + 1] == '\n') {
-					crlf(out);
-					col = 0;
-					i++;
-					continue;
-				}
-				if (b == '\n') {
-					crlf(out);
-					col = 0;
-					continue;
-				}
-			}
-			boolean literal;
-			if (b == ' ' || b == '\t') {
-				// whitespace at the end of a line must be encoded
-				literal = !atLineEnd(data, i + 1, text);
-			} else {
-				literal = b >= 33 && b <= 126 && b != '=';
-			}
-			int len = literal ? 1 : 3;
-			if (col + len > MAX_LINE - 1) {
-				out.write('=');
-				crlf(out);
-				col = 0;
-			}
-			if (literal) {
-				out.write(b);
-			} else {
-				out.write('=');
-				out.write(Character.toUpperCase(Character.forDigit(b >> 4, 16)));
-				out.write(Character.toUpperCase(Character.forDigit(b & 0xf, 16)));
-			}
-			col += len;
+		try (OutputStream enc = encoder(out, text)) {
+			enc.write(data);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e); // can't happen in memory
 		}
 		return out.toByteArray();
-	}
-
-	private static boolean atLineEnd(byte[] data, int j, boolean text) {
-		if (j >= data.length) {
-			return true;
-		}
-		return text && (data[j] == '\n' || (data[j] == '\r' && j + 1 < data.length && data[j + 1] == '\n'));
-	}
-
-	private static void crlf(ByteArrayOutputStream out) {
-		out.write('\r');
-		out.write('\n');
 	}
 
 	/**
@@ -80,69 +42,287 @@ public final class QuotedPrintable {
 	 * and trailing whitespace on encoded lines is removed as RFC 2045 requires.
 	 */
 	public static byte[] decode(byte[] data) {
-		byte[] out = new byte[data.length];
-		int n = 0;
-		int wsStart = -1; // start of a run of literal trailing whitespace in out
-		int i = 0;
-		while (i < data.length) {
-			int b = data[i] & 0xff;
-			if (b == '=') {
-				int j = i + 1;
-				while (j < data.length && (data[j] == ' ' || data[j] == '\t')) {
-					j++;
+		try (InputStream in = decoder(new ByteArrayInputStream(data))) {
+			return in.readAllBytes();
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+	}
+
+	/** A stream that quoted-printable encodes what is written to it. Closing it closes {@code out}. */
+	public static OutputStream encoder(OutputStream out, boolean text) {
+		return new Encoder(out, text);
+	}
+
+	/** A stream that decodes quoted-printable data read from {@code in}. */
+	public static InputStream decoder(InputStream in) {
+		return new Decoder(in);
+	}
+
+	private static final class Encoder extends FilterOutputStream {
+		private final boolean text;
+		private int col;
+		private int pendingWs = -1;     // a space or tab not yet known to be trailing
+		private boolean pendingCr;      // text mode: a CR that may start CRLF
+
+		Encoder(OutputStream out, boolean text) {
+			super(out);
+			this.text = text;
+		}
+
+		@Override
+		public void write(int b) throws IOException {
+			b &= 0xff;
+			if (text) {
+				if (pendingCr) {
+					pendingCr = false;
+					if (b == '\n') {
+						flushWs(true);
+						hardBreak();
+						return;
+					}
+					flushWs(false);
+					emit('\r'); // bare CR: encoded
 				}
-				if (j >= data.length) { // soft break at end of data
-					i = data.length;
-					wsStart = -1;
-					continue;
-				}
-				if (data[j] == '\r' && j + 1 < data.length && data[j + 1] == '\n') {
-					i = j + 2;
-					wsStart = -1;
-					continue;
-				}
-				if (data[j] == '\n') {
-					i = j + 1;
-					wsStart = -1;
-					continue;
-				}
-				if (i + 2 < data.length && MimeHeaderValue.hex((char) data[i + 1]) >= 0
-						&& MimeHeaderValue.hex((char) data[i + 2]) >= 0) {
-					out[n++] = (byte) (MimeHeaderValue.hex((char) data[i + 1]) * 16 + MimeHeaderValue.hex((char) data[i + 2]));
-					i += 3;
-				} else {
-					out[n++] = '=';
-					i++;
-				}
-				wsStart = -1;
-				continue;
-			}
-			if (b == '\n' || (b == '\r' && i + 1 < data.length && data[i + 1] == '\n')) {
-				if (wsStart >= 0) {
-					n = wsStart;
-				}
-				wsStart = -1;
 				if (b == '\r') {
-					out[n++] = '\r';
-					i++;
+					pendingCr = true;
+					return;
 				}
-				out[n++] = '\n';
-				i++;
-				continue;
+				if (b == '\n') {
+					flushWs(true);
+					hardBreak();
+					return;
+				}
 			}
+			flushWs(false);
 			if (b == ' ' || b == '\t') {
-				if (wsStart < 0) {
-					wsStart = n;
-				}
-			} else {
-				wsStart = -1;
+				pendingWs = b;
+				return;
 			}
-			out[n++] = (byte) b;
-			i++;
+			emit(b);
 		}
-		if (wsStart >= 0) {
-			n = wsStart;
+
+		@Override
+		public void write(byte[] b, int off, int len) throws IOException {
+			for (int i = off; i < off + len; i++) {
+				write(b[i]);
+			}
 		}
-		return Arrays.copyOf(out, n);
+
+		private void flushWs(boolean atLineEnd) throws IOException {
+			if (pendingWs >= 0) {
+				int ws = pendingWs;
+				pendingWs = -1;
+				if (atLineEnd) {
+					emitEncoded(ws);
+				} else {
+					emitLiteral(ws);
+				}
+			}
+		}
+
+		private void emit(int b) throws IOException {
+			if (b >= 33 && b <= 126 && b != '=') {
+				emitLiteral(b);
+			} else {
+				emitEncoded(b);
+			}
+		}
+
+		private void emitLiteral(int b) throws IOException {
+			softBreakIfNeeded(1);
+			out.write(b);
+			col++;
+		}
+
+		private void emitEncoded(int b) throws IOException {
+			softBreakIfNeeded(3);
+			out.write('=');
+			out.write(Character.toUpperCase(Character.forDigit(b >> 4, 16)));
+			out.write(Character.toUpperCase(Character.forDigit(b & 0xf, 16)));
+			col += 3;
+		}
+
+		private void softBreakIfNeeded(int len) throws IOException {
+			if (col + len > MAX_LINE - 1) {
+				out.write('=');
+				out.write('\r');
+				out.write('\n');
+				col = 0;
+			}
+		}
+
+		private void hardBreak() throws IOException {
+			out.write('\r');
+			out.write('\n');
+			col = 0;
+		}
+
+		/** Finishes the encoding: whitespace at the very end is encoded. */
+		@Override
+		public void close() throws IOException {
+			if (pendingCr) {
+				pendingCr = false;
+				flushWs(false);
+				emit('\r');
+			}
+			flushWs(true);
+			super.close();
+		}
+	}
+
+	private static final class Decoder extends InputStream {
+		/** A whitespace run longer than this can't be trailing whitespace of a valid line. */
+		private static final int MAX_WS = 4096;
+
+		private final PushbackInputStream in;
+		private final ByteArrayOutputStream ws = new ByteArrayOutputStream();
+		private final byte[] queue = new byte[MAX_WS + 4];
+		private int qPos;
+		private int qLen;
+		private boolean eof;
+
+		Decoder(InputStream in) {
+			this.in = new PushbackInputStream(in, 3);
+		}
+
+		@Override
+		public int read() throws IOException {
+			while (qPos >= qLen) {
+				if (eof) {
+					return -1;
+				}
+				fill();
+			}
+			return queue[qPos++] & 0xff;
+		}
+
+		@Override
+		public int read(byte[] b, int off, int len) throws IOException {
+			if (len == 0) {
+				return 0;
+			}
+			int n = 0;
+			while (n < len) {
+				if (qPos >= qLen) {
+					if (eof || (n > 0 && in.available() <= 0)) {
+						break;
+					}
+					fill();
+					continue;
+				}
+				int c = Math.min(len - n, qLen - qPos);
+				System.arraycopy(queue, qPos, b, off + n, c);
+				qPos += c;
+				n += c;
+			}
+			return n == 0 ? -1 : n;
+		}
+
+		private void put(int b) {
+			queue[qLen++] = (byte) b;
+		}
+
+		/** Pending literal whitespace is real content (something follows it on the line). */
+		private void flushWs() {
+			byte[] w = ws.toByteArray();
+			System.arraycopy(w, 0, queue, qLen, w.length);
+			qLen += w.length;
+			ws.reset();
+		}
+
+		/** Decode until at least one byte is queued or the input ends. */
+		private void fill() throws IOException {
+			qPos = 0;
+			qLen = 0;
+			while (qLen == 0) {
+				int b = in.read();
+				if (b < 0) {
+					ws.reset(); // trailing whitespace at the end is removed
+					eof = true;
+					return;
+				}
+				if (b == '=') {
+					decodeEquals();
+				} else if (b == '\r') {
+					int d = in.read();
+					if (d == '\n') {
+						ws.reset(); // trailing whitespace before a line break is removed
+						put('\r');
+						put('\n');
+					} else {
+						if (d >= 0) {
+							in.unread(d);
+						}
+						flushWs();
+						put('\r');
+					}
+				} else if (b == '\n') {
+					ws.reset();
+					put('\n');
+				} else if (b == ' ' || b == '\t') {
+					ws.write(b);
+					if (ws.size() >= MAX_WS) {
+						flushWs();
+					}
+				} else {
+					flushWs();
+					put(b);
+				}
+			}
+		}
+
+		private void decodeEquals() throws IOException {
+			flushWs(); // whitespace before '=' is content
+			int c = in.read();
+			// soft line break: '=' then optional whitespace then line end (or end of data)
+			int skipped = 0;
+			byte[] skippedWs = new byte[76];
+			while ((c == ' ' || c == '\t') && skipped < skippedWs.length) {
+				skippedWs[skipped++] = (byte) c;
+				c = in.read();
+			}
+			if (c < 0) {
+				return; // soft break at the end of the data
+			}
+			if (c == '\n') {
+				return;
+			}
+			if (c == '\r') {
+				int d = in.read();
+				if (d == '\n') {
+					return;
+				}
+				if (d >= 0) {
+					in.unread(d);
+				}
+			}
+			if (skipped == 0) {
+				int h1 = MimeHeaderValue.hex((char) c);
+				if (h1 >= 0) {
+					int d = in.read();
+					int h2 = d < 0 ? -1 : MimeHeaderValue.hex((char) d);
+					if (h2 >= 0) {
+						put(h1 * 16 + h2);
+						return;
+					}
+					if (d >= 0) {
+						in.unread(d);
+					}
+				}
+				in.unread(c);
+				put('=');
+				return;
+			}
+			// '=' followed by whitespace and then other text: keep it all literally
+			in.unread(c);
+			put('=');
+			ws.write(skippedWs, 0, skipped);
+		}
+
+		@Override
+		public void close() throws IOException {
+			in.close();
+		}
 	}
 }
