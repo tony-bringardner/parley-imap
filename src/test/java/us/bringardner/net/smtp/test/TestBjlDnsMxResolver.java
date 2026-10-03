@@ -1,0 +1,236 @@
+package us.bringardner.net.smtp.test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.File;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.nio.file.Files;
+import java.util.List;
+
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+
+import us.bringardner.net.dns.server.DnsServer;
+import us.bringardner.net.smtp.queue.BjlDnsMxResolver;
+import us.bringardner.net.smtp.queue.DeliveryException;
+import us.bringardner.net.smtp.queue.MxResolver;
+
+/**
+ * BjlDnsMxResolver against a real BjlDns {@link DnsServer}, configured with zone
+ * files in a temp directory and running on a free port on 127.0.0.1:
+ * <pre>
+ * mx.test        MX 10 mail1.mx.test, MX 20 mail2.mx.test
+ * implicit.test  A 127.0.0.3 (no MX)
+ * nullmx.test    MX 0 . (RFC 7505)
+ * </pre>
+ * The server is authoritative for these zones only and doesn't recurse, so a
+ * question about any other domain gets SERVFAIL.
+ */
+public class TestBjlDnsMxResolver {
+
+	private static DnsServer dns;
+	private static int dnsPort;
+	private static File dnsDir;
+
+	static final String MX_ZONE = String.join("\n",
+			"$ORIGIN mx.test.",
+			"$TTL 300",
+			"@       IN SOA ns.mx.test. admin.mx.test. ( 1 3600 600 86400 300 )",
+			"@       IN NS  ns.mx.test.",
+			"ns      IN A   127.0.0.1",
+			"@       IN MX  20 mail2.mx.test.",
+			"@       IN MX  10 mail1.mx.test.",
+			"mail1   IN A   127.0.0.1",
+			"mail2   IN A   127.0.0.2",
+			"txtonly IN TXT \"no mail here\"",
+			"");
+
+	static final String IMPLICIT_ZONE = String.join("\n",
+			"$ORIGIN implicit.test.",
+			"$TTL 300",
+			"@       IN SOA ns.mx.test. admin.mx.test. ( 1 3600 600 86400 300 )",
+			"@       IN NS  ns.mx.test.",
+			"@       IN A   127.0.0.3",
+			"");
+
+	static final String NULL_MX_ZONE = String.join("\n",
+			"$ORIGIN nullmx.test.",
+			"$TTL 300",
+			"@       IN SOA ns.mx.test. admin.mx.test. ( 1 3600 600 86400 300 )",
+			"@       IN NS  ns.mx.test.",
+			"@       IN MX  0 .",
+			"");
+
+	@BeforeAll
+	public static void startDns() throws Exception {
+		dnsDir = Files.createTempDirectory("bjldns").toFile();
+		File zones = new File(dnsDir, "zones");
+		zones.mkdirs();
+		Files.writeString(new File(zones, "mx.test.txt").toPath(), MX_ZONE);
+		Files.writeString(new File(zones, "implicit.test.txt").toPath(), IMPLICIT_ZONE);
+		Files.writeString(new File(zones, "nullmx.test.txt").toPath(), NULL_MX_ZONE);
+		dnsPort = freePort();
+		System.setProperty(DnsServer.PROP_DNS_DIR, dnsDir.getAbsolutePath());
+		System.setProperty(DnsServer.PROP_ZONE_DIR, zones.getAbsolutePath());
+		System.setProperty(DnsServer.PROP_DEFAULT_ZONE, "mx.test");
+		System.setProperty(DnsServer.PROP_PORT, String.valueOf(dnsPort));
+		System.setProperty(DnsServer.PROP_UDP_PORT, String.valueOf(dnsPort));
+		System.setProperty(DnsServer.PROP_TCP_PORT, String.valueOf(dnsPort));
+		System.setProperty(DnsServer.PROP_ADMIN_PORT, String.valueOf(freePort()));
+		System.setProperty(DnsServer.PROP_BIND_ADDRESS, "127.0.0.1");
+		System.setProperty(DnsServer.PROP_USE_DATABASE, "false");
+		dns = new DnsServer();
+		dns.start();
+		dns.awaitStarted(10000);
+		assertTrue(dns.isRunning(), "the DNS server started");
+	}
+
+	/** A port free for both UDP and TCP. */
+	private static int freePort() throws Exception {
+		for (int i = 0; i < 20; i++) {
+			try (ServerSocket tcp = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
+					DatagramSocket udp = new DatagramSocket(tcp.getLocalPort(), InetAddress.getByName("127.0.0.1"))) {
+				return tcp.getLocalPort();
+			} catch (java.net.BindException e) {
+				// try another
+			}
+		}
+		throw new IllegalStateException("No free port");
+	}
+
+	@AfterAll
+	public static void stopDns() throws Exception {
+		if (dns != null) {
+			dns.stopAndWait(10000);
+		}
+		if (dnsDir != null) {
+			try (var walk = Files.walk(dnsDir.toPath())) {
+				walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
+			}
+		}
+	}
+
+	private static BjlDnsMxResolver resolver() throws Exception {
+		BjlDnsMxResolver r = new BjlDnsMxResolver(List.of(InetAddress.getLoopbackAddress()));
+		r.setDnsPort(dnsPort);
+		r.setTimeout(1000);
+		r.setRetries(1);
+		return r;
+	}
+
+	@Test
+	public void testMxByPreference() throws Exception {
+		List<MxResolver.Route> routes = resolver().resolve("mx.test", 2525);
+		assertEquals(2, routes.size(), routes.toString());
+		assertEquals("mail1.mx.test", routes.get(0).host, "lowest preference first");
+		assertEquals("127.0.0.1", routes.get(0).address.getHostAddress());
+		assertEquals("mail2.mx.test", routes.get(1).host);
+		assertEquals("127.0.0.2", routes.get(1).address.getHostAddress());
+		assertEquals(2525, routes.get(0).port);
+	}
+
+	@Test
+	public void testImplicitMx() throws Exception {
+		List<MxResolver.Route> routes = resolver().resolve("implicit.test", 25);
+		assertEquals(1, routes.size());
+		assertEquals("implicit.test", routes.get(0).host);
+		assertEquals("127.0.0.3", routes.get(0).address.getHostAddress());
+	}
+
+	@Test
+	public void testFailures() throws Exception {
+		BjlDnsMxResolver r = resolver();
+		DeliveryException e = assertThrows(DeliveryException.class, () -> r.resolve("nullmx.test", 25));
+		assertTrue(e.isPermanent());
+		assertEquals("5.1.10", e.getStatus());
+		e = assertThrows(DeliveryException.class, () -> r.resolve("nosuchname.mx.test", 25));
+		assertTrue(e.isPermanent(), "NXDOMAIN");
+		assertEquals("5.1.2", e.getStatus());
+		e = assertThrows(DeliveryException.class, () -> r.resolve("txtonly.mx.test", 25));
+		assertTrue(e.isPermanent(), "no MX and no address");
+		e = assertThrows(DeliveryException.class, () -> r.resolve("elsewhere.test", 25));
+		assertFalse(e.isPermanent(), "SERVFAIL (not our zone, no recursion) is temporary");
+		assertEquals("4.4.3", e.getStatus());
+	}
+
+	@Test
+	public void testNextServerAndLiterals() throws Exception {
+		// the first server doesn't answer (nothing listens there); the second does
+		BjlDnsMxResolver r = new BjlDnsMxResolver(List.of(InetAddress.getByName("127.0.0.2"), InetAddress.getByName("127.0.0.1")));
+		r.setDnsPort(dnsPort);
+		r.setTimeout(300);
+		r.setRetries(1);
+		assertEquals(2, r.resolve("mx.test", 25).size());
+
+		// no server answers: temporary
+		BjlDnsMxResolver none = new BjlDnsMxResolver(List.of(InetAddress.getByName("127.0.0.2")));
+		none.setDnsPort(dnsPort);
+		none.setTimeout(300);
+		none.setRetries(1);
+		DeliveryException e = assertThrows(DeliveryException.class, () -> none.resolve("mx.test", 25));
+		assertFalse(e.isPermanent(), "a timeout is temporary");
+
+		List<MxResolver.Route> lit = resolver().resolve("[127.0.0.9]", 25);
+		assertEquals("127.0.0.9", lit.get(0).address.getHostAddress());
+	}
+
+	/** The queue relays through routes found with BjlDns (the SMTP client connects to their addresses). */
+	@Test
+	public void testRelayWithBjlDns() throws Exception {
+		us.bringardner.io.filesource.FileSourceFactory f = us.bringardner.io.filesource.FileSourceFactory.getDefaultFactory();
+		us.bringardner.io.filesource.FileSource rootA = f.createTempDirectory("dnsA");
+		us.bringardner.io.filesource.FileSource rootB = f.createTempDirectory("dnsB");
+		System.setProperty("SmtpServer." + us.bringardner.net.framework.server.FileBasedAcl.PROP_FILE_NAME, "Pop3TestAcl.txt");
+		System.setProperty("SmtpServer." + us.bringardner.net.framework.server.IServer.AUTHENTICATION_PROVIDER_PROPERTY,
+				us.bringardner.net.framework.server.FileBasedAcl.class.getName());
+		us.bringardner.net.smtp.server.SmtpServer b = new us.bringardner.net.smtp.server.SmtpServer(0, "JSmtp", false);
+		us.bringardner.net.smtp.server.SmtpServer a = new us.bringardner.net.smtp.server.SmtpServer(0, "JSmtp", false);
+		try {
+			b.setMaildropRoot(rootB);
+			b.setHostname("mail1.mx.test");
+			b.getDeliveryConfig().getLocalDomains().clear();
+			b.addLocalDomain("mx.test");
+			b.getLogger().setLevel(us.bringardner.core.ILogger.Level.ERROR);
+			b.startAndWait(10000);
+
+			a.setMaildropRoot(rootA);
+			a.setHostname("mx.a.test");
+			a.getDeliveryConfig().getLocalDomains().clear();
+			a.addLocalDomain("a.test");
+			a.addRelayNetwork("127.0.0.1/32");
+			a.getDeliveryConfig().setResolver(resolver());
+			a.getDeliveryConfig().setRemotePort(b.getLocalPort());
+			a.getLogger().setLevel(us.bringardner.core.ILogger.Level.ERROR);
+			a.startAndWait(10000);
+
+			try (TestSmtpServer.Client c = new TestSmtpServer.Client(a.getLocalPort())) {
+				c.ok("EHLO client.example", "250");
+				String r = c.sendMail("app@a.test", "tony@mx.test", "Subject: via BjlDns\r\n\r\nhi\r\n");
+				assertTrue(r.startsWith("250"), r);
+			}
+			TestSmtpServer.waitFor(() -> TestSmtpServer.count(rootB, "tony") == 1, 30000, "relay through mail1.mx.test");
+			String m = TestSmtpServer.inbox(rootB, "tony").get(0);
+			assertTrue(m.contains("by mail1.mx.test (BjlEmail)"), m);
+		} finally {
+			a.stop();
+			b.stop();
+			deleteAll(rootA);
+			deleteAll(rootB);
+		}
+	}
+
+	private static void deleteAll(us.bringardner.io.filesource.FileSource f) throws java.io.IOException {
+		if (f.isDirectory()) {
+			for (us.bringardner.io.filesource.FileSource k : f.listFiles()) {
+				deleteAll(k);
+			}
+		}
+		f.delete();
+	}
+}

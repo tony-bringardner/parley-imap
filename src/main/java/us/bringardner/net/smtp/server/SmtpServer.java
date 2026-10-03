@@ -27,6 +27,7 @@ import us.bringardner.net.framework.server.IAccessControlList;
 import us.bringardner.net.framework.server.Server;
 import us.bringardner.net.smtp.MailAddress;
 import us.bringardner.net.smtp.SMTP;
+import us.bringardner.net.smtp.queue.BjlDnsMxResolver;
 import us.bringardner.net.smtp.queue.DeliveryConfig;
 import us.bringardner.net.smtp.queue.MailQueue;
 import us.bringardner.net.smtp.queue.QueueEntry;
@@ -243,6 +244,26 @@ public class SmtpServer extends Server implements SMTP {
 			c.setTlsMode(DeliveryConfig.TlsMode.valueOf(tmp.toUpperCase(Locale.ROOT)));
 		}
 		c.setRemotePort(Integer.getInteger(P + "remotePort", SMTP_PORT));
+		tmp = System.getProperty(P + "resolver", "jdk").trim().toLowerCase(Locale.ROOT);
+		try {
+			switch (tmp) {
+			case "bjldns": {
+				String list = System.getProperty(P + "dnsServers");
+				c.setResolver(new BjlDnsMxResolver(list == null || list.isBlank() ? BjlDnsMxResolver.systemServers()
+						: BjlDnsMxResolver.parseServers(list)));
+				break;
+			}
+			case "bjldns-iterative":
+				c.setResolver(BjlDnsMxResolver.iterative());
+				break;
+			case "jdk":
+				break;
+			default:
+				logInfo("Unknown " + P + "resolver '" + tmp + "'; using the JDK resolver");
+			}
+		} catch (IOException | RuntimeException e) {
+			logError("Can't set up the " + tmp + " resolver; using the JDK resolver", e);
+		}
 		c.setWorkers(Integer.getInteger(P + "queue.workers", 4));
 		tmp = System.getProperty(P + "queue.retry");
 		if (tmp != null) {
@@ -376,8 +397,10 @@ public class SmtpServer extends Server implements SMTP {
 		Boolean ret = tlsAvailable;
 		if (ret == null) {
 			try {
-				ret = getSSLContext("TLS") != null;
-			} catch (IOException | RuntimeException e) {
+				// a key store must be configured: without keys a TLS handshake can only fail
+				javax.net.ssl.KeyManager[] km = getKeyManagers();
+				ret = km != null && km.length > 0 && getSSLContext("TLS") != null;
+			} catch (Exception e) {
 				ret = false;
 			}
 			tlsAvailable = ret;

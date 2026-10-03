@@ -309,8 +309,10 @@ public class Pop3Server extends Server implements POP3 {
 		Boolean ret = tlsAvailable;
 		if (ret == null) {
 			try {
-				ret = getSSLContext("TLS") != null;
-			} catch (IOException | RuntimeException e) {
+				// a key store must be configured: without keys a TLS handshake can only fail
+				javax.net.ssl.KeyManager[] km = getKeyManagers();
+				ret = km != null && km.length > 0 && getSSLContext("TLS") != null;
+			} catch (Exception e) {
 				logDebug("TLS is not available: " + e);
 				ret = false;
 			}

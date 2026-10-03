@@ -284,7 +284,17 @@ public class TestSmtpServer {
 		return ret;
 	}
 
+	/**
+	 * Empty a maildrop. Waits until the queues have nothing left from earlier
+	 * tests, so no late delivery lands in the new maildrop.
+	 */
 	static void reset(FileSource root, String maildrop) throws IOException {
+		try {
+			waitFor(() -> (a == null || a.getQueue().getEntries().isEmpty()) && (b == null || b.getQueue().getEntries().isEmpty()),
+					30000, "the queues to empty");
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
 		deleteAll(root.getChild(maildrop));
 	}
 
@@ -386,7 +396,16 @@ public class TestSmtpServer {
 		MailStore store = new MailStore(rootA.getChild("tony"), MailboxRegistry.get());
 		Mailbox mb = store.open("INBOX");
 		try {
-			assertEquals(2, mb.count());
+			mb.refresh(true); // as SELECT does
+			StringBuilder files = new StringBuilder();
+			for (FileSource f : rootA.getChild("tony").listFiles()) {
+				files.append(f.getName()).append(' ');
+			}
+			StringBuilder msgs = new StringBuilder();
+			for (var info : mb.getMessages()) {
+				msgs.append(info.getUid()).append('=').append(info.getName()).append(' ');
+			}
+			assertEquals(2, mb.count(), "files: " + files + " index: " + msgs);
 		} finally {
 			MailboxRegistry.get().release(mb);
 		}

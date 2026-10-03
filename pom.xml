@@ -124,6 +124,23 @@
   			<artifactId>bjl_file_system</artifactId>
   			<version>1.0.2-SNAPSHOT</version>
 		</dependency>
+		<!-- DNS client for BjlDnsMxResolver (MX lookups for the SMTP queue).
+		     bjl_core and bjl_io come from the framework instead of its older versions. -->
+		<dependency>
+  			<groupId>us.bringardner</groupId>
+  			<artifactId>bjl_dns</artifactId>
+  			<version>1.0.0</version>
+  			<exclusions>
+  				<exclusion>
+  					<groupId>us.bringardner</groupId>
+  					<artifactId>bjl_core</artifactId>
+  				</exclusion>
+  				<exclusion>
+  					<groupId>us.bringardner</groupId>
+  					<artifactId>bjl_io</artifactId>
+  				</exclusion>
+  			</exclusions>
+		</dependency>
 
 		<dependency>
 			<groupId>org.junit.jupiter</groupId>

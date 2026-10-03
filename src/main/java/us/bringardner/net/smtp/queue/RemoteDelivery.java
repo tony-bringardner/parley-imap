@@ -99,7 +99,7 @@ public final class RemoteDelivery {
 		DeliveryConfig.TlsMode tlsMode = smartHost ? config.getRelayTlsMode() : config.getTlsMode();
 		SmtpClient c;
 		try {
-			c = new SmtpClient(route.host, route.port, config.getConnectTimeout(), config.getReadTimeout());
+			c = new SmtpClient(route.host, route.address, route.port, config.getConnectTimeout(), config.getReadTimeout());
 		} catch (IOException e) {
 			throw new HostFailure(new DeliveryException(false, "4.4.1", "Can't connect to " + route + ": " + e.getMessage(),
 					null, mta));

@@ -7,7 +7,7 @@ Email for the Bringardner Java Library:
 - `us.bringardner.net.imap`: an IMAP server (IMAP4rev2, RFC 9051, also speaking IMAP4rev1), built the same way and sharing mail with the POP3 server.
 - `us.bringardner.net.smtp`: an SMTP server and mail transfer agent (RFC 5321), built the same way: it receives mail, delivers it to the same maildrops, and relays mail for other domains through a persistent queue.
 
-Requires Java 21 and Maven. Depends on `bjl_file_system` and `bjl_net_framework` (which bring in `bjl_core` and `bjl_io`).
+Requires Java 21 and Maven. Depends on `bjl_file_system`, `bjl_net_framework` (which bring in `bjl_core` and `bjl_io`) and `bjl_dns` (for `BjlDnsMxResolver`).
 
 ## Build
 
@@ -242,7 +242,12 @@ The server follows RFC 5321 and its pending revision, draft-ietf-emailcore-rfc53
 - **Local delivery** goes into the user's INBOX, the same maildrop POP3 and IMAP use. It adds `Return-Path` and `Delivered-To`. IMAP sessions in the same process see the new message at once.
 - **Aliases:** `JSmtp.aliases` names a file of lines like `sales: tony, jose@example.org`. Members may be local users or remote addresses. Alias loops are stopped.
 - **Remote delivery:**
-  - The queue looks up MX records (JDK DNS). With no MX record it uses the domain's own address, and a null MX means the domain takes no mail.
+  - The queue looks up MX records. With no MX record it uses the domain's own address, and a null MX means the domain takes no mail.
+  - Two resolvers are included, chosen with `JSmtp.resolver`:
+    - `jdk` (default): `DnsMxResolver`, the JDK's DNS provider.
+    - `bjldns`: `BjlDnsMxResolver`, which makes every DNS request with BjlDns: the MX query and the A/AAAA lookups of the mail hosts. It asks the servers in `JSmtp.dnsServers` (comma-separated), or those in `/etc/resolv.conf`, in turn.
+    - `bjldns-iterative`: BjlDns's own iterative resolver, which starts from the root servers in its `sbelt.prop`.
+    - Any other `MxResolver` can be set with `getDeliveryConfig().setResolver(...)`.
   - It tries hosts in order of preference, with opportunistic STARTTLS.
   - It uses SIZE, 8BITMIME, SMTPUTF8, CHUNKING/BINARYMIME and DSN when the message needs them. A message needing SMTPUTF8 is returned (5.6.7) by a server without it, as RFC 6531 requires.
 - **Smart host:** set `JSmtp.relayHost=host:port` (with `JSmtp.relayUser`/`JSmtp.relayPassword`) to send all outgoing mail through your provider. Many home and cloud networks block outgoing port 25. The smart host requires TLS with a valid certificate (`JSmtp.relayTls`).
@@ -270,6 +275,7 @@ The server follows RFC 5321 and its pending revision, draft-ietf-emailcore-rfc53
 | `JSmtp.timeout` | 300000 ms | Idle session timeout (RFC 5321 requires at least 5 minutes) |
 | `JSmtp.aliases`, `JSmtp.postmaster` | none, `postmaster` | Aliases file; user who receives postmaster mail |
 | `JSmtp.relayHost`, `JSmtp.relayUser`, `JSmtp.relayPassword`, `JSmtp.relayTls` | none, none, none, `required` | Smart host |
+| `JSmtp.resolver`, `JSmtp.dnsServers` | `jdk`, from `/etc/resolv.conf` | MX resolver: `jdk`, `bjldns` or `bjldns-iterative`; DNS servers for `bjldns` |
 | `JSmtp.tls` | `opportunistic` | STARTTLS to MX hosts: `none`, `opportunistic` or `required` |
 | `JSmtp.queue.workers`, `JSmtp.queue.retry`, `JSmtp.queue.delayWarningHours`, `JSmtp.queue.maxAgeHours` | 4, `1,5,15,30,60,120`, 4, 120 | Queue settings |
 | `SmtpServer.KeyStoreName`, `SmtpServer.KeyStorePassword`, `SmtpServer.KeyStoreType` | none | Key store for STARTTLS and port 465 |
@@ -291,5 +297,7 @@ The server follows RFC 5321 and its pending revision, draft-ietf-emailcore-rfc53
 - SMTPUTF8;
 - a queue that survives a restart;
 - a 70 MB message under the 64 MB test heap.
+
+`TestBjlDnsMxResolver` starts a real BjlDns `DnsServer` on a free port on 127.0.0.1, with zone files written to a temp directory (`mx.test` with two MX hosts, `implicit.test` with only an A record, `nullmx.test` with a null MX). It checks `BjlDnsMxResolver` against it and relays a message between two SMTP servers using the MX hosts it finds.
 
 Python's `smtplib` (with `starttls()` and `login()`) works with the server.

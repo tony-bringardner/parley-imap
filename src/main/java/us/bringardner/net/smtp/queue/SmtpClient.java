@@ -77,10 +77,20 @@ public class SmtpClient implements Closeable {
 	private boolean esmtp;
 
 	public SmtpClient(String host, int port, int connectTimeout, int readTimeout) throws IOException {
+		this(host, null, port, connectTimeout, readTimeout);
+	}
+
+	/**
+	 * Connect to {@code address} (or, if null, to {@code host} looked up by the
+	 * JDK); {@code host} is still the name used for TLS.
+	 */
+	public SmtpClient(String host, java.net.InetAddress address, int port, int connectTimeout, int readTimeout)
+			throws IOException {
 		this.host = host;
 		this.readTimeout = readTimeout;
 		socket = new Socket();
-		socket.connect(new InetSocketAddress(host, port), connectTimeout);
+		socket.connect(address != null ? new InetSocketAddress(address, port) : new InetSocketAddress(host, port),
+				connectTimeout);
 		socket.setSoTimeout(readTimeout);
 		streams();
 	}
