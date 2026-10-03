@@ -7,7 +7,7 @@ Email for the Bringardner Java Library:
 - `us.bringardner.net.imap`: an IMAP server (IMAP4rev2, RFC 9051, also speaking IMAP4rev1), built the same way and sharing mail with the POP3 server.
 - `us.bringardner.net.smtp`: an SMTP server and mail transfer agent (RFC 5321), built the same way: it receives mail, delivers it to the same maildrops, and relays mail for other domains through a persistent queue.
 
-Requires Java 21 and Maven. Depends on `bjl_file_system`, `bjl_net_framework` (which bring in `bjl_core` and `bjl_io`) and `bjl_dns` (for `BjlDnsMxResolver`).
+Requires Java 11 or later and Maven. Depends on `bjl_file_system`, `bjl_net_framework` (which bring in `bjl_core` and `bjl_io`) and `bjl_dns` (for `BjlDnsMxResolver`).
 
 ## Build
 
@@ -276,6 +276,7 @@ The server follows RFC 5321 and its pending revision, draft-ietf-emailcore-rfc53
 | `JSmtp.aliases`, `JSmtp.postmaster` | none, `postmaster` | Aliases file; user who receives postmaster mail |
 | `JSmtp.relayHost`, `JSmtp.relayUser`, `JSmtp.relayPassword`, `JSmtp.relayTls` | none, none, none, `required` | Smart host |
 | `JSmtp.resolver`, `JSmtp.dnsServers` | `jdk`, from `/etc/resolv.conf` | MX resolver: `jdk`, `bjldns` or `bjldns-iterative`; DNS servers for `bjldns` |
+| `JSmtp.preferIpv6` | false | With `bjldns`: try mail hosts' IPv6 addresses before IPv4 (every host's addresses of both families are tried either way) |
 | `JSmtp.tls` | `opportunistic` | STARTTLS to MX hosts: `none`, `opportunistic` or `required` |
 | `JSmtp.queue.workers`, `JSmtp.queue.retry`, `JSmtp.queue.delayWarningHours`, `JSmtp.queue.maxAgeHours` | 4, `1,5,15,30,60,120`, 4, 120 | Queue settings |
 | `SmtpServer.KeyStoreName`, `SmtpServer.KeyStorePassword`, `SmtpServer.KeyStoreType` | none | Key store for STARTTLS and port 465 |
@@ -298,6 +299,6 @@ The server follows RFC 5321 and its pending revision, draft-ietf-emailcore-rfc53
 - a queue that survives a restart;
 - a 70 MB message under the 64 MB test heap.
 
-`TestBjlDnsMxResolver` starts a real BjlDns `DnsServer` on a free port on 127.0.0.1, with zone files written to a temp directory (`mx.test` with two MX hosts, `implicit.test` with only an A record, `nullmx.test` with a null MX). It checks `BjlDnsMxResolver` against it and relays a message between two SMTP servers using the MX hosts it finds.
+`TestBjlDnsMxResolver` starts a real BjlDns `DnsServer` on a free port on 127.0.0.1, with zone files written to a temp directory (`mx.test` with two MX hosts, `implicit.test` with only an A record, `nullmx.test` with a null MX). It checks `BjlDnsMxResolver` against it, including a host with both A and AAAA records and an IPv6-only host (`v6only.test`), and relays messages between two SMTP servers using the MX hosts it finds: over IPv4, over IPv6 (`::1`), and from an unreachable IPv6 address to the host's IPv4 address. The IPv6 relay test is skipped on machines without an IPv6 loopback.
 
 Python's `smtplib` (with `starttls()` and `login()`) works with the server.

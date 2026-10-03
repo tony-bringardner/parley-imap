@@ -11,7 +11,8 @@
 
 	<properties>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-		<maven.compiler.release>21</maven.compiler.release>
+		<!-- The oldest Java the code and its bjl_* dependencies (built for Java 11) run on -->
+		<maven.compiler.release>11</maven.compiler.release>
 		<!-- Branch the GitHub site plugin pushes to on deploy; override with -Dbranch-name=... -->
 		<branch-name>V${project.version}</branch-name>
 	</properties>

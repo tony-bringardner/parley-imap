@@ -51,6 +51,7 @@ public class BjlDnsMxResolver implements MxResolver {
 	private int timeout = 3000;
 	private int retries = 2;
 	private int maxAddressesPerHost = 2;
+	private boolean preferIpv6;
 	private final Random random = new Random();
 
 	/** Stub mode with the system's DNS servers (the nameserver lines of /etc/resolv.conf). */
@@ -142,7 +143,20 @@ public class BjlDnsMxResolver implements MxResolver {
 		this.retries = Math.max(1, retries);
 	}
 
-	/** How many addresses of each mail host to try. */
+	/**
+	 * Try a host's IPv6 addresses before its IPv4 ones. Off by default: many
+	 * receivers check reverse DNS and reputation more strictly over IPv6, so
+	 * IPv4 first is the safer default for SMTP.
+	 */
+	public void setPreferIpv6(boolean preferIpv6) {
+		this.preferIpv6 = preferIpv6;
+	}
+
+	public boolean isPreferIpv6() {
+		return preferIpv6;
+	}
+
+	/** How many addresses of each family to try for each mail host. */
 	public void setMaxAddressesPerHost(int max) {
 		this.maxAddressesPerHost = Math.max(1, max);
 	}
@@ -225,9 +239,13 @@ public class BjlDnsMxResolver implements MxResolver {
 	}
 
 	/**
-	 * The addresses of a host: from the additional section of {@code answer} if
-	 * it has them (the server sends them along with MX records), else A and AAAA
-	 * queries. IPv4 first.
+	 * The addresses of a host. Addresses in the additional section of
+	 * {@code answer} are used, and an A or AAAA query is made for each family the
+	 * section didn't cover, so a host with both IPv4 and IPv6 addresses gets both.
+	 * IPv4 first unless {@link #setPreferIpv6(boolean)}; at most
+	 * {@link #setMaxAddressesPerHost(int)} of each family.
+	 *
+	 * @throws DeliveryException if the lookups failed and no address was found
 	 */
 	List<InetAddress> addresses(String host, Message answer) throws DeliveryException {
 		List<InetAddress> v4 = new ArrayList<>();
@@ -239,24 +257,39 @@ public class BjlDnsMxResolver implements MxResolver {
 				}
 			}
 		}
-		if (v4.isEmpty() && v6.isEmpty()) {
-			Message a = query(host, DNS.A);
-			for (RR rr : a.getAnswer()) {
-				add(rr, v4, v6);
-			}
-			if (a.getResponseCode() != DNS.NAME_ERROR) {
-				Message aaaa = query(host, DNS.AAAA);
-				for (RR rr : aaaa.getAnswer()) {
+		DeliveryException failure = null;
+		boolean noSuchHost = false;
+		if (v4.isEmpty()) {
+			try {
+				Message a = query(host, DNS.A);
+				noSuchHost = a.getResponseCode() == DNS.NAME_ERROR;
+				for (RR rr : a.getAnswer()) {
 					add(rr, v4, v6);
 				}
+			} catch (DeliveryException e) {
+				failure = e;
 			}
 		}
-		List<InetAddress> ret = new ArrayList<>();
-		for (int i = 0; i < v4.size() && i < maxAddressesPerHost; i++) {
-			ret.add(v4.get(i));
+		if (v6.isEmpty() && !noSuchHost) {
+			try {
+				for (RR rr : query(host, DNS.AAAA).getAnswer()) {
+					add(rr, v4, v6);
+				}
+			} catch (DeliveryException e) {
+				failure = e;
+			}
 		}
-		for (int i = 0; i < v6.size() && ret.size() < maxAddressesPerHost * 2 && i < maxAddressesPerHost; i++) {
-			ret.add(v6.get(i));
+		if (v4.isEmpty() && v6.isEmpty() && failure != null) {
+			throw failure;
+		}
+		List<InetAddress> first = preferIpv6 ? v6 : v4;
+		List<InetAddress> second = preferIpv6 ? v4 : v6;
+		List<InetAddress> ret = new ArrayList<>();
+		for (int i = 0; i < first.size() && i < maxAddressesPerHost; i++) {
+			ret.add(first.get(i));
+		}
+		for (int i = 0; i < second.size() && i < maxAddressesPerHost; i++) {
+			ret.add(second.get(i));
 		}
 		return ret;
 	}

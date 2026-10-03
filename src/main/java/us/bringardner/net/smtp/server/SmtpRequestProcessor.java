@@ -445,7 +445,8 @@ public class SmtpRequestProcessor extends AbstractCommandProcessor implements SM
 		t.out = new BufferedOutputStream(t.incoming.getOutputStream(), 64 * 1024);
 		String client = getClientAddress().getHostAddress();
 		if (client.indexOf(':') >= 0) {
-			client = "IPv6:" + client;
+			int zone = client.indexOf('%');
+			client = "IPv6:" + (zone > 0 ? client.substring(0, zone) : client);
 		}
 		StringBuilder r = new StringBuilder("Received: from ").append(helo == null ? "unknown" : sanitize(helo))
 				.append(" ([").append(client).append("])\r\n\tby ").append(getSmtpServer().getHostname())

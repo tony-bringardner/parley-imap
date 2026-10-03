@@ -249,8 +249,10 @@ public class SmtpServer extends Server implements SMTP {
 			switch (tmp) {
 			case "bjldns": {
 				String list = System.getProperty(P + "dnsServers");
-				c.setResolver(new BjlDnsMxResolver(list == null || list.isBlank() ? BjlDnsMxResolver.systemServers()
-						: BjlDnsMxResolver.parseServers(list)));
+				BjlDnsMxResolver r = new BjlDnsMxResolver(list == null || list.isBlank() ? BjlDnsMxResolver.systemServers()
+						: BjlDnsMxResolver.parseServers(list));
+				r.setPreferIpv6(Boolean.getBoolean(P + "preferIpv6"));
+				c.setResolver(r);
 				break;
 			}
 			case "bjldns-iterative":

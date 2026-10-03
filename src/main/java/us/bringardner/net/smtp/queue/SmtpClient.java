@@ -214,7 +214,7 @@ public class SmtpClient implements Closeable {
 			if (verify) {
 				params.setEndpointIdentificationAlgorithm("HTTPS");
 			}
-			if (!host.matches("[0-9.:]+")) {
+			if (host.indexOf(':') < 0 && !host.matches("[0-9.]+")) { // SNI is for names, not addresses
 				params.setServerNames(List.of(new SNIHostName(host)));
 			}
 			ssl.setSSLParameters(params);

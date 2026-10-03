@@ -507,7 +507,7 @@ public final class FetchRenderer {
 			long[] r = partial(a, total);
 			out.write(name + " ");
 			try (InputStream in = o.open()) {
-				in.skipNBytes(r[0]);
+				skipFully(in, r[0]);
 				out.literal(r[1], in, literal8);
 			}
 		};
@@ -532,7 +532,7 @@ public final class FetchRenderer {
 			out.write(name + " ");
 			try (InputStream in = opener.open()) {
 				if (r[0] > 0) {
-					in.skipNBytes(r[0]);
+					skipFully(in, r[0]);
 				}
 				out.literal(r[1], in, false);
 			}
@@ -587,5 +587,19 @@ public final class FetchRenderer {
 
 	static Set<String> seen() {
 		return Set.of(IMAP.SEEN);
+	}
+
+	/** Skip exactly {@code n} bytes (InputStream.skipNBytes needs Java 12). */
+	static void skipFully(InputStream in, long n) throws IOException {
+		while (n > 0) {
+			long k = in.skip(n);
+			if (k <= 0) {
+				if (in.read() < 0) {
+					throw new java.io.EOFException("Content ended early");
+				}
+				k = 1;
+			}
+			n -= k;
+		}
 	}
 }

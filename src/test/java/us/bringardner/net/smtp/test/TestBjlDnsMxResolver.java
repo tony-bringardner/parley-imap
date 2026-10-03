@@ -4,9 +4,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.File;
 import java.net.DatagramSocket;
+import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.nio.file.Files;
@@ -19,15 +21,17 @@ import org.junit.jupiter.api.Test;
 import us.bringardner.net.dns.server.DnsServer;
 import us.bringardner.net.smtp.queue.BjlDnsMxResolver;
 import us.bringardner.net.smtp.queue.DeliveryException;
+import us.bringardner.net.smtp.queue.DnsMxResolver;
 import us.bringardner.net.smtp.queue.MxResolver;
 
 /**
  * BjlDnsMxResolver against a real BjlDns {@link DnsServer}, configured with zone
  * files in a temp directory and running on a free port on 127.0.0.1:
  * <pre>
- * mx.test        MX 10 mail1.mx.test, MX 20 mail2.mx.test
+ * mx.test        MX 10 mail1.mx.test (A), MX 20 mail2.mx.test (A and AAAA)
  * implicit.test  A 127.0.0.3 (no MX)
  * nullmx.test    MX 0 . (RFC 7505)
+ * v6only.test    MX 10 mail6.v6only.test, which has only AAAA ::1
  * </pre>
  * The server is authoritative for these zones only and doesn't recurse, so a
  * question about any other domain gets SERVFAIL.
@@ -48,6 +52,7 @@ public class TestBjlDnsMxResolver {
 			"@       IN MX  10 mail1.mx.test.",
 			"mail1   IN A   127.0.0.1",
 			"mail2   IN A   127.0.0.2",
+			"mail2   IN AAAA ::1",
 			"txtonly IN TXT \"no mail here\"",
 			"");
 
@@ -57,6 +62,16 @@ public class TestBjlDnsMxResolver {
 			"@       IN SOA ns.mx.test. admin.mx.test. ( 1 3600 600 86400 300 )",
 			"@       IN NS  ns.mx.test.",
 			"@       IN A   127.0.0.3",
+			"");
+
+	/** A domain whose only mail host has only an IPv6 address. */
+	static final String V6_ONLY_ZONE = String.join("\n",
+			"$ORIGIN v6only.test.",
+			"$TTL 300",
+			"@       IN SOA ns.mx.test. admin.mx.test. ( 1 3600 600 86400 300 )",
+			"@       IN NS  ns.mx.test.",
+			"@       IN MX  10 mail6.v6only.test.",
+			"mail6   IN AAAA ::1",
 			"");
 
 	static final String NULL_MX_ZONE = String.join("\n",
@@ -75,6 +90,7 @@ public class TestBjlDnsMxResolver {
 		Files.writeString(new File(zones, "mx.test.txt").toPath(), MX_ZONE);
 		Files.writeString(new File(zones, "implicit.test.txt").toPath(), IMPLICIT_ZONE);
 		Files.writeString(new File(zones, "nullmx.test.txt").toPath(), NULL_MX_ZONE);
+		Files.writeString(new File(zones, "v6only.test.txt").toPath(), V6_ONLY_ZONE);
 		dnsPort = freePort();
 		System.setProperty(DnsServer.PROP_DNS_DIR, dnsDir.getAbsolutePath());
 		System.setProperty(DnsServer.PROP_ZONE_DIR, zones.getAbsolutePath());
@@ -127,12 +143,39 @@ public class TestBjlDnsMxResolver {
 	@Test
 	public void testMxByPreference() throws Exception {
 		List<MxResolver.Route> routes = resolver().resolve("mx.test", 2525);
-		assertEquals(2, routes.size(), routes.toString());
+		assertEquals(3, routes.size(), routes.toString());
 		assertEquals("mail1.mx.test", routes.get(0).host, "lowest preference first");
 		assertEquals("127.0.0.1", routes.get(0).address.getHostAddress());
 		assertEquals("mail2.mx.test", routes.get(1).host);
-		assertEquals("127.0.0.2", routes.get(1).address.getHostAddress());
+		assertEquals("127.0.0.2", routes.get(1).address.getHostAddress(), "IPv4 first");
+		assertEquals("mail2.mx.test", routes.get(2).host);
+		assertTrue(routes.get(2).address instanceof Inet6Address, "and its IPv6 address: " + routes);
+		assertTrue(routes.get(2).address.isLoopbackAddress());
 		assertEquals(2525, routes.get(0).port);
+	}
+
+	/** Both families are found even when the MX answer carries only the A record (glue). */
+	@Test
+	public void testBothAddressFamilies() throws Exception {
+		BjlDnsMxResolver r = resolver();
+		r.setPreferIpv6(true);
+		List<MxResolver.Route> routes = r.resolve("mx.test", 25);
+		assertEquals("mail2.mx.test", routes.get(1).host);
+		assertTrue(routes.get(1).address instanceof Inet6Address, "IPv6 first when preferred: " + routes);
+		assertEquals("127.0.0.2", routes.get(2).address.getHostAddress());
+
+		routes = resolver().resolve("v6only.test", 25);
+		assertEquals(1, routes.size(), routes.toString());
+		assertEquals("mail6.v6only.test", routes.get(0).host);
+		assertTrue(routes.get(0).address instanceof Inet6Address, "an IPv6-only host still gets a route");
+	}
+
+	@Test
+	public void testIpv6Literals() throws Exception {
+		List<MxResolver.Route> routes = resolver().resolve("[IPv6:2001:db8::25]", 25);
+		assertEquals(InetAddress.getByName("2001:db8::25"), routes.get(0).address);
+		routes = new DnsMxResolver().resolve("[IPv6:2001:db8::25]", 25);
+		assertEquals("2001:db8::25", routes.get(0).host);
 	}
 
 	@Test
@@ -166,7 +209,7 @@ public class TestBjlDnsMxResolver {
 		r.setDnsPort(dnsPort);
 		r.setTimeout(300);
 		r.setRetries(1);
-		assertEquals(2, r.resolve("mx.test", 25).size());
+		assertEquals(3, r.resolve("mx.test", 25).size());
 
 		// no server answers: temporary
 		BjlDnsMxResolver none = new BjlDnsMxResolver(List.of(InetAddress.getByName("127.0.0.2")));
@@ -180,9 +223,21 @@ public class TestBjlDnsMxResolver {
 		assertEquals("127.0.0.9", lit.get(0).address.getHostAddress());
 	}
 
-	/** The queue relays through routes found with BjlDns (the SMTP client connects to their addresses). */
-	@Test
-	public void testRelayWithBjlDns() throws Exception {
+	/** True if this machine has an IPv6 loopback (CI containers sometimes don't). */
+	static boolean ipv6Available() {
+		try (ServerSocket s = new ServerSocket(0, 1, InetAddress.getByName("::1"))) {
+			return true;
+		} catch (Exception e) {
+			return false;
+		}
+	}
+
+	/**
+	 * Start a receiving server B for {@code domain} and a relaying server A that
+	 * finds B with {@code resolver}; send one message from A to tony@domain and
+	 * return it as B stored it.
+	 */
+	private static String relay(String domain, MxResolver resolver) throws Exception {
 		us.bringardner.io.filesource.FileSourceFactory f = us.bringardner.io.filesource.FileSourceFactory.getDefaultFactory();
 		us.bringardner.io.filesource.FileSource rootA = f.createTempDirectory("dnsA");
 		us.bringardner.io.filesource.FileSource rootB = f.createTempDirectory("dnsB");
@@ -193,9 +248,9 @@ public class TestBjlDnsMxResolver {
 		us.bringardner.net.smtp.server.SmtpServer a = new us.bringardner.net.smtp.server.SmtpServer(0, "JSmtp", false);
 		try {
 			b.setMaildropRoot(rootB);
-			b.setHostname("mail1.mx.test");
+			b.setHostname("mx." + domain);
 			b.getDeliveryConfig().getLocalDomains().clear();
-			b.addLocalDomain("mx.test");
+			b.addLocalDomain(domain);
 			b.getLogger().setLevel(us.bringardner.core.ILogger.Level.ERROR);
 			b.startAndWait(10000);
 
@@ -204,25 +259,53 @@ public class TestBjlDnsMxResolver {
 			a.getDeliveryConfig().getLocalDomains().clear();
 			a.addLocalDomain("a.test");
 			a.addRelayNetwork("127.0.0.1/32");
-			a.getDeliveryConfig().setResolver(resolver());
+			a.addRelayNetwork("::1/128");
+			a.getDeliveryConfig().setResolver(resolver);
 			a.getDeliveryConfig().setRemotePort(b.getLocalPort());
+			a.getDeliveryConfig().setConnectTimeout(1000);
 			a.getLogger().setLevel(us.bringardner.core.ILogger.Level.ERROR);
 			a.startAndWait(10000);
 
 			try (TestSmtpServer.Client c = new TestSmtpServer.Client(a.getLocalPort())) {
 				c.ok("EHLO client.example", "250");
-				String r = c.sendMail("app@a.test", "tony@mx.test", "Subject: via BjlDns\r\n\r\nhi\r\n");
+				String r = c.sendMail("app@a.test", "tony@" + domain, "Subject: relayed\r\n\r\nhi\r\n");
 				assertTrue(r.startsWith("250"), r);
 			}
-			TestSmtpServer.waitFor(() -> TestSmtpServer.count(rootB, "tony") == 1, 30000, "relay through mail1.mx.test");
-			String m = TestSmtpServer.inbox(rootB, "tony").get(0);
-			assertTrue(m.contains("by mail1.mx.test (BjlEmail)"), m);
+			TestSmtpServer.waitFor(() -> TestSmtpServer.count(rootB, "tony") == 1, 30000, "relay to " + domain);
+			return TestSmtpServer.inbox(rootB, "tony").get(0);
 		} finally {
 			a.stop();
 			b.stop();
 			deleteAll(rootA);
 			deleteAll(rootB);
 		}
+	}
+
+	/** The queue relays through routes found with BjlDns (the SMTP client connects to their addresses). */
+	@Test
+	public void testRelayWithBjlDns() throws Exception {
+		String m = relay("mx.test", resolver());
+		assertTrue(m.contains("by mx.mx.test (BjlEmail)"), m);
+		assertTrue(m.contains("from mx.a.test ([127.0.0.1])"), "A connected to mail1's IPv4 address: " + m);
+	}
+
+	/** Delivery to a mail host that has only an IPv6 address, over ::1. Skipped without IPv6. */
+	@Test
+	public void testRelayOverIpv6() throws Exception {
+		assumeTrue(ipv6Available(), "no IPv6 loopback on this machine");
+		String m = relay("v6only.test", resolver());
+		assertTrue(m.contains("from mx.a.test ([IPv6:"), "B saw an IPv6 client: " + m);
+	}
+
+	/** An unreachable IPv6 address is skipped for the host's next (IPv4) address. Runs with or without IPv6. */
+	@Test
+	public void testFallbackBetweenFamilies() throws Exception {
+		InetAddress unreachable = InetAddress.getByName("2001:db8::25"); // documentation prefix
+		InetAddress v4 = InetAddress.getByName("127.0.0.1");
+		MxResolver r = (domain, port) -> List.of(new MxResolver.Route("mail1." + domain, unreachable, port),
+				new MxResolver.Route("mail1." + domain, v4, port));
+		String m = relay("fallback.test", r);
+		assertTrue(m.contains("from mx.a.test ([127.0.0.1])"), m);
 	}
 
 	private static void deleteAll(us.bringardner.io.filesource.FileSource f) throws java.io.IOException {
