@@ -5,6 +5,7 @@ Email for the Bringardner Java Library:
 - `us.bringardner.net.email`: internet messages (`Message`), with MIME, RFC 2231 parameters, RFC 2047 encoded words and RFC 6532 UTF-8 headers. Messages are stored in a `FileSource`, so they can be larger than memory. `Downgrader` makes the RFC 6858 surrogate of a message with UTF-8 headers.
 - `us.bringardner.net.pop3`: a POP3 server (RFC 1939), built like the FTP server in BjlNetFtp.
 - `us.bringardner.net.imap`: an IMAP server (IMAP4rev2, RFC 9051, also speaking IMAP4rev1), built the same way and sharing mail with the POP3 server.
+- `us.bringardner.net.smtp`: an SMTP server and mail transfer agent (RFC 5321), built the same way: it receives mail, delivers it to the same maildrops, and relays mail for other domains through a persistent queue.
 
 Requires Java 21 and Maven. Depends on `bjl_file_system` and `bjl_net_framework` (which bring in `bjl_core` and `bjl_io`).
 
@@ -171,3 +172,124 @@ Users come from the access control list, set up as for Pop3Server with the `Imap
 The server also works with Python's `imaplib` and with `curl` (`imap://`, including `--ssl-reqd`).
 
 User names with non-ASCII characters (like the test user `jösé`) become directory names, so the JVM must use UTF-8 for file names. That is the default on macOS. On Linux, run with a UTF-8 locale (e.g. `LANG=C.UTF-8`).
+
+## SMTP server
+
+`SmtpServer` follows the same design:
+
+| BjlNetFtp | BjlEmail | Role |
+|---|---|---|
+| `FtpServer` | `SmtpServer` | Accepts connections, holds the configuration |
+| `FtpRequestProcessor` | `SmtpRequestProcessor` | Runs one session |
+| `FtpCommandFactory` | `SmtpCommandFactory` | Maps command names to command classes |
+| `FtpCommand`, `commands.*` | `SmtpCommand`, `commands.*` | One class per command |
+| `FTP` | `SMTP` | Protocol constants |
+
+Behind the sessions is `MailQueue` (package `us.bringardner.net.smtp.queue`). It delivers mail locally, relays it to other servers and sends delivery status notifications.
+
+```java
+SmtpServer relay = new SmtpServer();               // port 25
+relay.setMaildropRoot(rootFileSource);             // the same root as POP3 and IMAP
+relay.addLocalDomain("example.com");
+relay.start();
+
+SmtpServer submission = SmtpServer.submissionServer(false);   // port 587
+submission.setQueue(relay.getQueue());             // one queue for both
+submission.start();
+
+relay.send(from, List.of(to), message);            // send mail from code
+```
+
+Or from the command line: `java us.bringardner.net.smtp.server.SmtpServer -DJSmtp.domains=example.com -DJSmtp.root=/var/mail/pop3`. This starts port 25 and, unless `JSmtp.submissionPort=0`, port 587.
+
+### Protocol support
+
+The server follows RFC 5321 and its pending revision, draft-ietf-emailcore-rfc5321bis (in the RFC Editor queue). It supports:
+
+| Extension | RFC |
+|---|---|
+| PIPELINING | 2920 |
+| SIZE | 1870 |
+| 8BITMIME | 6152 |
+| SMTPUTF8 | 6531 |
+| ENHANCEDSTATUSCODES | 2034, 3463 |
+| CHUNKING and BINARYMIME (BDAT) | 3030 |
+| DSN | 3461, 3464, 6533 |
+| STARTTLS | 3207 |
+| AUTH PLAIN and LOGIN | 4954, 4616 |
+| Message submission | 6409 |
+| Implicit TLS (port 465) | 8314 |
+| Null MX | 7505 |
+
+- **Commands:** EHLO, HELO, MAIL, RCPT, DATA, BDAT, RSET, NOOP, QUIT, VRFY (always 252), EXPN (502), HELP, STARTTLS and AUTH.
+- **Received headers** name the protocol per RFC 3848 and RFC 6531, e.g. `ESMTPSA` or `UTF8SMTPS`.
+- **Protections:**
+  - Only CRLF `.` CRLF ends DATA, which defeats "SMTP smuggling". A `.` after a bare LF is content.
+  - A message with more than 100 Received headers is refused as a loop.
+  - HTTP requests are refused.
+  - The session closes after 20 errors or 3 failed logins.
+
+### Who can send what
+
+- **Mail for the local domains** (`JSmtp.domains`) is accepted from anyone, but only for existing users, aliases and `postmaster`. Unknown users get `550 5.1.1`. A `+detail` suffix is ignored when looking up the user.
+- **Mail for other domains** is accepted only from authenticated users (who need the WRITE permission) or from `JSmtp.relayNetworks`. Everyone else gets `550 5.7.1 Relay access denied`, so the server is not an open relay.
+- **Submission servers** (port 587/465) require AUTH and add `Date` and `Message-ID` when they're missing.
+- **requireTls:** with `JSmtp.requireTls`, AUTH is offered only after STARTTLS. It is off by default, as for POP3 and IMAP; turn it on for submission on a public network.
+
+### The queue and delivery
+
+- **Safe before 250:** accepted mail is written to `<root>/.smtp-queue` (an `.eml` and an `.env` file per message) before the server replies 250. It survives a restart.
+- **Local delivery** goes into the user's INBOX, the same maildrop POP3 and IMAP use. It adds `Return-Path` and `Delivered-To`. IMAP sessions in the same process see the new message at once.
+- **Aliases:** `JSmtp.aliases` names a file of lines like `sales: tony, jose@example.org`. Members may be local users or remote addresses. Alias loops are stopped.
+- **Remote delivery:**
+  - The queue looks up MX records (JDK DNS). With no MX record it uses the domain's own address, and a null MX means the domain takes no mail.
+  - It tries hosts in order of preference, with opportunistic STARTTLS.
+  - It uses SIZE, 8BITMIME, SMTPUTF8, CHUNKING/BINARYMIME and DSN when the message needs them. A message needing SMTPUTF8 is returned (5.6.7) by a server without it, as RFC 6531 requires.
+- **Smart host:** set `JSmtp.relayHost=host:port` (with `JSmtp.relayUser`/`JSmtp.relayPassword`) to send all outgoing mail through your provider. Many home and cloud networks block outgoing port 25. The smart host requires TLS with a valid certificate (`JSmtp.relayTls`).
+- **Retries:** temporary failures are retried on `JSmtp.queue.retry` (minutes, default `1,5,15,30,60,120`).
+  - The sender gets a "delayed" notice after `JSmtp.queue.delayWarningHours` (default 4).
+  - The message is returned after `JSmtp.queue.maxAgeHours` (default 120).
+- **Notifications** are RFC 3464 multipart/report messages from `MAILER-DAEMON`.
+  - They honour NOTIFY, RET, ENVID and ORCPT.
+  - For UTF-8 addresses or messages they use `message/global-delivery-status` and `message/global`.
+  - A notification is never sent about a notification.
+
+### Configuration
+
+| Property | Default | Meaning |
+|---|---|---|
+| `JSmtp.port` | 25 | Relay port (used by `main`) |
+| `JSmtp.submissionPort` / `JSmtp.submissionsPort` | 587 / 0 | Submission ports started by `main` (0 = none); 465 uses implicit TLS |
+| `JSmtp.root` | `JPop3.root`, else `/pop3` | Maildrop root, shared with POP3 and IMAP; the queue is `.smtp-queue` inside it |
+| `JSmtp.hostname` | the local host name | Name in the greeting, Received headers and notifications |
+| `JSmtp.domains` | the host name | Local domains, comma-separated |
+| `JSmtp.relayNetworks` | none | Networks that may relay without AUTH, e.g. `127.0.0.1/32,10.0.0.0/8` |
+| `JSmtp.requireTls` | false | AUTH (and MAIL on submission ports) only after STARTTLS |
+| `JSmtp.maxMessageSize` | 52428800 | SIZE limit |
+| `JSmtp.maxRecipients` | 100 | Recipients per message |
+| `JSmtp.timeout` | 300000 ms | Idle session timeout (RFC 5321 requires at least 5 minutes) |
+| `JSmtp.aliases`, `JSmtp.postmaster` | none, `postmaster` | Aliases file; user who receives postmaster mail |
+| `JSmtp.relayHost`, `JSmtp.relayUser`, `JSmtp.relayPassword`, `JSmtp.relayTls` | none, none, none, `required` | Smart host |
+| `JSmtp.tls` | `opportunistic` | STARTTLS to MX hosts: `none`, `opportunistic` or `required` |
+| `JSmtp.queue.workers`, `JSmtp.queue.retry`, `JSmtp.queue.delayWarningHours`, `JSmtp.queue.maxAgeHours` | 4, `1,5,15,30,60,120`, 4, 120 | Queue settings |
+| `SmtpServer.KeyStoreName`, `SmtpServer.KeyStorePassword`, `SmtpServer.KeyStoreType` | none | Key store for STARTTLS and port 465 |
+
+### Not included
+
+- **Sender authentication:** there is no DKIM signing (RFC 6376), SPF or DMARC checking, and no spam filtering. Large providers often reject or junk unsigned mail from a new server, so for mail to them, use a smart host or add DKIM.
+- **Envelope sender:** authenticated users may use any address as the sender; it isn't checked against the login.
+- **Optional extensions:** REQUIRETLS, MT-PRIORITY and DELIVERBY aren't implemented.
+
+### Testing
+
+`TestSmtpServer` runs two servers on real sockets. Server A (`a.test`) relays to server B (`b.test`) through a test MX resolver. The tests cover:
+
+- local delivery, aliases, `postmaster` and relay refusal;
+- submission with STARTTLS, AUTH PLAIN and AUTH LOGIN;
+- bounces with DSN parameters, delay and expiry notices;
+- PIPELINING, BDAT and BINARYMIME, smuggling and loop protection;
+- SMTPUTF8;
+- a queue that survives a restart;
+- a 70 MB message under the 64 MB test heap.
+
+Python's `smtplib` (with `starttls()` and `login()`) works with the server.
