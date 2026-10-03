@@ -10,9 +10,12 @@ import java.util.Set;
 
 import us.bringardner.io.filesource.FileSource;
 import us.bringardner.net.framework.server.IAccessControlList;
+import us.bringardner.net.smtp.dkim.Dkim;
 
 /** How the queue delivers mail: local domains and users, routing, retries. */
 public class DeliveryConfig {
+
+	private final Dkim dkim = new Dkim();
 
 	/** TLS for outgoing connections. */
 	public enum TlsMode {
@@ -273,5 +276,10 @@ public class DeliveryConfig {
 
 	public void setMaxReturnSize(long maxReturnSize) {
 		this.maxReturnSize = maxReturnSize;
+	}
+
+	/** DKIM signing keys and verification settings (RFC 6376). */
+	public Dkim getDkim() {
+		return dkim;
 	}
 }

@@ -18,6 +18,8 @@ import us.bringardner.net.dns.DNS;
 import us.bringardner.net.dns.Message;
 import us.bringardner.net.dns.Mx;
 import us.bringardner.net.dns.RR;
+import us.bringardner.net.dns.resolve.Lookup;
+import us.bringardner.net.dns.resolve.LookupResult;
 import us.bringardner.net.dns.resolve.Resolver;
 
 /**
@@ -308,6 +310,24 @@ public class BjlDnsMxResolver implements MxResolver {
 		} catch (UnknownHostException e) {
 			// a malformed address: skip it
 		}
+	}
+
+	/**
+	 * The TXT records of a name (for DKIM keys and the like), each record's
+	 * strings joined. A timeout or server failure is
+	 * {@link LookupResult.Status#TEMPFAIL}.
+	 */
+	public LookupResult<String> txt(String name) {
+		if (mode == Mode.ITERATIVE) {
+			return Lookup.txt(name);
+		}
+		Message m;
+		try {
+			m = query(name, DNS.TXT);
+		} catch (DeliveryException e) {
+			m = null;
+		}
+		return Lookup.txt(name, m);
 	}
 
 	/**

@@ -5,6 +5,7 @@ Email for the Bringardner Java Library:
 - `us.bringardner.net.email`: internet messages (`Message`), with MIME, RFC 2231 parameters, RFC 2047 encoded words and RFC 6532 UTF-8 headers. Messages are stored in a `FileSource`, so they can be larger than memory. `Downgrader` makes the RFC 6858 surrogate of a message with UTF-8 headers.
 - `us.bringardner.net.pop3`: a POP3 server (RFC 1939), built like the FTP server in BjlNetFtp.
 - `us.bringardner.net.imap`: an IMAP server (IMAP4rev2, RFC 9051, also speaking IMAP4rev1), built the same way and sharing mail with the POP3 server.
+- `us.bringardner.net.imap.client`: an IMAP client library designed to be the mail engine of a desktop application, and `ImapCli`, a command-line program built on it.
 - `us.bringardner.net.smtp`: an SMTP server and mail transfer agent (RFC 5321), built the same way: it receives mail, delivers it to the same maildrops, and relays mail for other domains through a persistent queue.
 
 Requires Java 11 or later and Maven. Depends on `bjl_file_system`, `bjl_net_framework` (which bring in `bjl_core` and `bjl_io`) and `bjl_dns` (for `BjlDnsMxResolver`).
@@ -173,6 +174,85 @@ The server also works with Python's `imaplib` and with `curl` (`imap://`, includ
 
 User names with non-ASCII characters (like the test user `jösé`) become directory names, so the JVM must use UTF-8 for file names. That is the default on macOS. On Linux, run with a UTF-8 locale (e.g. `LANG=C.UTF-8`).
 
+## IMAP client
+
+`us.bringardner.net.imap.client` talks to any IMAP server (IMAP4rev2 or IMAP4rev1). The API is built for a desktop application; `ImapCli` is a command-line program on top of it.
+
+### Using the API
+
+```java
+ImapClientConfig config = new ImapClientConfig("imap.example.com", ImapClientConfig.Security.TLS)
+        .setEventExecutor(SwingUtilities::invokeLater);   // listeners run on the Swing thread
+ImapClient client = new ImapClient(config);
+client.connect();
+client.login("tony", password);
+
+for (MailboxInfo m : client.listAll()) { ... }           // name, delimiter, \Sent, \Trash...
+SelectedMailbox inbox = client.select("INBOX");          // count, UIDVALIDITY, UIDs
+List<MessageSummary> page = client.fetchSummaries("1:*"); // envelope, flags, size, MIME structure
+
+MessageSummary m = page.get(0);
+BodyPart text = m.getStructure().findText("PLAIN");
+String body = client.fetchText(m.getUid(), text);
+for (BodyPart p : m.getStructure().flatten()) {
+    if (p.isAttachment()) {
+        try (OutputStream out = new FileOutputStream(p.getFilename())) {
+            client.fetchPart(m.getUid(), p, out, (done, total) -> progressBar.setValue(...));
+        }
+    }
+}
+
+client.addListener(new ImapListener() {
+    public void exists(String mailbox, long count) { /* new mail: fetch it */ }
+    public void expunged(String mailbox, long msn, long uid) { /* remove the row */ }
+    public void flagsChanged(String mailbox, long msn, long uid, Set<String> flags) { ... }
+    public void disconnected(Exception cause) { /* offer to reconnect */ }
+});
+client.startIdle();                                       // live updates
+
+client.submit(c -> c.search(SearchCriteria.and(SearchCriteria.unseen(), SearchCriteria.from("fred"))))
+      .thenAccept(uids -> SwingUtilities.invokeLater(() -> show(uids)));
+```
+
+Design points:
+
+- **Thread safe.** Any thread may call any method; commands run one at a time. `submit()` runs work on the client's own thread and returns a `CompletableFuture`, so the user interface never waits on the network.
+- **Events, not polling.** `ImapListener` hears about new mail, expunges, flag changes, alerts and a lost connection, from IDLE or from any command's responses. Events go to an executor you choose (`SwingUtilities::invokeLater`, `Platform::runLater`); by default a daemon thread.
+- **IDLE stays out of the way.** While IDLE is running, any call stops it (DONE), runs, and starts it again. IDLE is renewed every 25 minutes. Servers without IDLE are polled with NOOP.
+- **UIDs throughout.** Messages are addressed by UID. `SelectedMailbox` keeps the sequence-number-to-UID map current through EXISTS and EXPUNGE, so an event can name the message.
+- **Any message size.** Bodies and attachments are streamed to an `OutputStream` with `ProgressListener` callbacks. `fetchPart` returns decoded content: the server decodes with BINARY (RFC 3516) when offered, else the client removes base64 or quoted-printable itself. `append` streams from an `InputStream`.
+- **Parsed for display.** `Envelope` (with RFC 2047 names and subjects decoded) and `BodyPart` (part numbers, file names including RFC 2231, attachment detection) come from one FETCH, so a message list needs no message bodies.
+- **Framework connections.** Sockets, TLS, STARTTLS and certificate trust come from the framework's `Client`. A `DynamicTrustManager.CertificateValidator` decides about certificates the system doesn't trust; the framework's `VisualCertificateValidator` is a ready-made Swing dialog, and "always" answers are remembered.
+- **Protocol.** IMAP4rev2 and UTF8=ACCEPT are enabled when offered; mailbox names are UTF-8 or modified UTF-7 as the session needs. Login uses AUTHENTICATE PLAIN with SASL-IR, or LOGIN. Literals are non-synchronizing with LITERAL+ or LITERAL-. MOVE falls back to COPY + UID EXPUNGE; COPYUID and APPENDUID are returned. `execute()` sends any other command.
+- **Errors.** A NO or BAD answer throws `ImapException` (status, response code such as `TRYCREATE`, server text); the connection stays usable. A lost connection throws `IOException` and fires `disconnected`.
+
+### The command-line program
+
+```
+java -cp target/classes:<dependencies> us.bringardner.net.imap.client.ImapCli --host imap.example.com --user tony
+Connected to imap.example.com:993
+Password for tony:
+imap> select INBOX
+INBOX: 42 messages
+INBOX> ls 3
+    40     2026-10-01 09:12  Fred Foo              Lunch?                                    2.1 KB
+    41 N   2026-10-02 15:00  José                  Grüße                                     1.4 KB
+    42 NF @ 2026-10-03 08:30  Build server          Nightly report                           88.0 KB
+3 of 42 messages
+INBOX> show 42
+INBOX> get 42 2 report.pdf
+```
+
+Options: `--host`, `--port`, `--tls` (the default, port 993), `--starttls`, `--plain` (STARTTLS if offered), `--insecure`, `--user`, `--password` (else `$IMAP_PASSWORD`, else a prompt), `--trust-all` (test servers only), `--timeout SECONDS`, `--rev1`, `--trace` (the protocol, with passwords hidden).
+
+Commands (type `help`): `list`, `lsub`, `status`, `select`, `examine`, `create`, `delete`, `rename`, `subscribe`, `unsubscribe`, `close`, `ls`, `show`, `parts`, `save`, `get`, `search`, `flag`, `unflag`, `read`, `unread`, `rm`, `expunge`, `cp`, `mv`, `put`, `idle`, `caps`, `noop`, `raw`, `trace`, `quit`.
+
+Commands can also come from a script on standard input, or one command can follow the options (`ImapCli --host h --user u status INBOX`). The exit code is 0 if every command worked, 1 if one failed, 2 for a usage error. An untrusted certificate is shown with its SHA-256 fingerprint and you're asked whether to trust it; without a terminal it is rejected.
+
+### Testing
+
+`TestImapClient` runs the client and the program against `ImapServer`: IMAP4rev2 and IMAP4rev1 (modified UTF-7), STARTTLS and implicit TLS, MIME parts and decoding, search, flags, copy, move, IDLE events between two sessions, calls from several threads, a script for `ImapCli`, and a 70 MB message appended and fetched (whole and as a decoded attachment) under the 64 MB test heap. `TestImapClientParts` tests the response parser and the envelope and body structure parsing without a server.
+
 ## SMTP server
 
 `SmtpServer` follows the same design:
@@ -259,6 +339,41 @@ The server follows RFC 5321 and its pending revision, draft-ietf-emailcore-rfc53
   - For UTF-8 addresses or messages they use `message/global-delivery-status` and `message/global`.
   - A notification is never sent about a notification.
 
+### DKIM (RFC 6376)
+
+The server signs outgoing mail and verifies the signatures of incoming mail. The code is in `us.bringardner.net.smtp.dkim`, and all DNS lookups go through BjlDns.
+
+**Signing.** Mail from authenticated users and from `JSmtp.relayNetworks` is signed with the key of its From domain. A key for `example.com` also signs mail from `news.example.com`. Bounces and mail sent from code (`send`, `MailQueue.enqueue`) are signed the same way. Mail with no matching key is sent unsigned.
+
+- RSA keys sign with `rsa-sha256`, and Ed25519 keys with `ed25519-sha256` (RFC 8463; Ed25519 needs Java 15 or later at run time).
+- Signatures use relaxed/relaxed canonicalization. They cover the usual fields (From, To, Cc, Subject, Date, Message-ID, MIME fields, List-* fields...), and the main ones are "over-signed" so a second From or Subject can't be added later.
+- The DKIM-Signature field goes at the top of the message. Delivery never changes the content, so the signature stays valid.
+
+To set up a key:
+
+```
+java -cp bjl_email.jar:... us.bringardner.net.smtp.dkim.DkimKeys rsa /etc/dkim/example.com.pem
+```
+
+This writes the private key (PKCS#8 PEM) and prints the TXT record to publish at `<selector>._domainkey.example.com`, for example `mail2026._domainkey.example.com`. Then set `JSmtp.dkim.keys=example.com:mail2026:/etc/dkim/example.com.pem`, with more keys separated by commas. Keys from openssl work too (`-----BEGIN PRIVATE KEY-----` or `-----BEGIN RSA PRIVATE KEY-----`), but not encrypted ones. In code:
+
+```java
+relay.getDkim().addSigner(new DkimSigner("example.com", "mail2026", DkimKeys.privateKey(new File("/etc/dkim/example.com.pem"))));
+```
+
+**Verifying.** Mail from other servers (clients that are neither authenticated nor in `JSmtp.relayNetworks`) is checked, and the result is added after our Received field:
+
+```
+Authentication-Results: mx.example.com;
+	dkim=pass header.d=example.org header.i=@example.org header.s=sel1 header.a=rsa-sha256 header.b=AbCd1234
+```
+
+- The results are `pass`, `fail` (the body or header hash doesn't match), `permerror` (bad signature, no key, revoked key, rsa-sha1, RSA keys under 1024 bits), `temperror` (DNS failed), or `none` (no signature). Up to 5 signatures are checked.
+- The message is accepted whatever the result. Rejecting is a policy decision, for DMARC to make.
+- Authentication-Results fields that claim to come from this server (`JSmtp.hostname`) are removed first (RFC 8601 section 5).
+- The body is hashed as it streams from the queue file, so large messages are never held in memory.
+- Keys are looked up with the `bjldns` resolver's DNS servers when `JSmtp.resolver=bjldns` (or `bjldns-iterative`). Otherwise the servers in `/etc/resolv.conf` are asked through BjlDns. Turn verification off with `JSmtp.dkim.verify=false`.
+
 ### Configuration
 
 | Property | Default | Meaning |
@@ -279,11 +394,14 @@ The server follows RFC 5321 and its pending revision, draft-ietf-emailcore-rfc53
 | `JSmtp.preferIpv6` | false | With `bjldns`: try mail hosts' IPv6 addresses before IPv4 (every host's addresses of both families are tried either way) |
 | `JSmtp.tls` | `opportunistic` | STARTTLS to MX hosts: `none`, `opportunistic` or `required` |
 | `JSmtp.queue.workers`, `JSmtp.queue.retry`, `JSmtp.queue.delayWarningHours`, `JSmtp.queue.maxAgeHours` | 4, `1,5,15,30,60,120`, 4, 120 | Queue settings |
+| `JSmtp.dkim.keys` | none | DKIM signing keys: `domain:selector:keyfile`, comma-separated |
+| `JSmtp.dkim.headers` | see above | Fields to sign, comma-separated (From is required) |
+| `JSmtp.dkim.verify` | true | Verify DKIM signatures of incoming mail and add Authentication-Results |
 | `SmtpServer.KeyStoreName`, `SmtpServer.KeyStorePassword`, `SmtpServer.KeyStoreType` | none | Key store for STARTTLS and port 465 |
 
 ### Not included
 
-- **Sender authentication:** there is no DKIM signing (RFC 6376), SPF or DMARC checking, and no spam filtering. Large providers often reject or junk unsigned mail from a new server, so for mail to them, use a smart host or add DKIM.
+- **SPF, DMARC and spam filtering:** DKIM is supported (see above), but SPF (RFC 7208) and DMARC (RFC 7489) checks and spam filtering are not.
 - **Envelope sender:** authenticated users may use any address as the sender; it isn't checked against the login.
 - **Optional extensions:** REQUIRETLS, MT-PRIORITY and DELIVERBY aren't implemented.
 
@@ -298,6 +416,8 @@ The server follows RFC 5321 and its pending revision, draft-ietf-emailcore-rfc53
 - SMTPUTF8;
 - a queue that survives a restart;
 - a 70 MB message under the 64 MB test heap.
+
+`TestDkim` checks signing and verification against the RFC 8463 example message (RSA and Ed25519) and the RFC 6376 canonicalization examples. `TestDkimSmtp` runs a signing server that relays to a verifying one, and covers forged Authentication-Results, signed bounces, and mail queued from code. `TestBjlDnsMxResolver` looks a DKIM key up from a BjlDns server.
 
 `TestBjlDnsMxResolver` starts a real BjlDns `DnsServer` on a free port on 127.0.0.1, with zone files written to a temp directory (`mx.test` with two MX hosts, `implicit.test` with only an A record, `nullmx.test` with a null MX). It checks `BjlDnsMxResolver` against it, including a host with both A and AAAA records and an IPv6-only host (`v6only.test`), and relays messages between two SMTP servers using the MX hosts it finds: over IPv4, over IPv6 (`::1`), and from an unreachable IPv6 address to the host's IPv4 address. The IPv6 relay test is skipped on machines without an IPv6 loopback.
 

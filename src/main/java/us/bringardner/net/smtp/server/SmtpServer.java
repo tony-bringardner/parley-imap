@@ -7,6 +7,7 @@ import java.io.InputStream;
 import java.net.InetAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -27,6 +28,7 @@ import us.bringardner.net.framework.server.IAccessControlList;
 import us.bringardner.net.framework.server.Server;
 import us.bringardner.net.smtp.MailAddress;
 import us.bringardner.net.smtp.SMTP;
+import us.bringardner.net.smtp.dkim.Dkim;
 import us.bringardner.net.smtp.queue.BjlDnsMxResolver;
 import us.bringardner.net.smtp.queue.DeliveryConfig;
 import us.bringardner.net.smtp.queue.MailQueue;
@@ -266,6 +268,19 @@ public class SmtpServer extends Server implements SMTP {
 		} catch (IOException | RuntimeException e) {
 			logError("Can't set up the " + tmp + " resolver; using the JDK resolver", e);
 		}
+		Dkim dkim = c.getDkim();
+		if (c.getResolver() instanceof BjlDnsMxResolver) {
+			dkim.setLookup(((BjlDnsMxResolver) c.getResolver())::txt); // the same DNS servers as for MX lookups
+		}
+		dkim.setVerify(Boolean.parseBoolean(System.getProperty(P + "dkim.verify", "true")));
+		tmp = System.getProperty(P + "dkim.keys");
+		if (tmp != null && !tmp.isBlank()) {
+			try {
+				dkim.addSigners(tmp, System.getProperty(P + "dkim.headers"));
+			} catch (IOException | GeneralSecurityException | RuntimeException e) {
+				logError("Can't load the DKIM keys (" + P + "dkim.keys); mail is sent unsigned", e);
+			}
+		}
 		c.setWorkers(Integer.getInteger(P + "queue.workers", 4));
 		tmp = System.getProperty(P + "queue.retry");
 		if (tmp != null) {
@@ -429,6 +444,14 @@ public class SmtpServer extends Server implements SMTP {
 	public void setHostname(String hostname) {
 		this.hostname = hostname;
 		deliveryConfig.setHostname(hostname);
+	}
+
+	/**
+	 * DKIM settings (shared by the servers that share a queue): add signing
+	 * keys with {@code getDkim().addSigner(...)}.
+	 */
+	public Dkim getDkim() {
+		return getDeliveryConfig().getDkim();
 	}
 
 	/** Add a domain whose mail is delivered locally. */

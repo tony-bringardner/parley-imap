@@ -54,6 +54,8 @@ public class TestBjlDnsMxResolver {
 			"mail2   IN A   127.0.0.2",
 			"mail2   IN AAAA ::1",
 			"txtonly IN TXT \"no mail here\"",
+			// a DKIM key longer than one 255-byte string (the RFC 8463 example RSA key)
+			"test._domainkey IN TXT \"v=DKIM1; k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDkHlOQoBTzWRiGs5V6NpP3idY6Wk08a5qhdR6wy5bdOKb2jLQiY/J16JYi0Qvx/b\" \"yYzCNb3W91y3FutACDfzwQ/BC/e/8uBsCR+yz1Lxj+PL6lHvqMKrM3rG4hstT5QjvHO9PzoxZyVYLzBfO2EeC3Ip3G+2kryOTIKT+l/K4w3QIDAQAB\"",
 			"");
 
 	static final String IMPLICIT_ZONE = String.join("\n",
@@ -200,6 +202,25 @@ public class TestBjlDnsMxResolver {
 		e = assertThrows(DeliveryException.class, () -> r.resolve("elsewhere.test", 25));
 		assertFalse(e.isPermanent(), "SERVFAIL (not our zone, no recursion) is temporary");
 		assertEquals("4.4.3", e.getStatus());
+	}
+
+	/** DKIM keys come from BjlDns too: TXT lookups through the same servers. */
+	@Test
+	public void testDkimKeyLookup() throws Exception {
+		BjlDnsMxResolver r = resolver();
+		us.bringardner.net.dns.resolve.LookupResult<String> key = r.txt("test._domainkey.mx.test");
+		assertTrue(key.isOk(), key.toString());
+		assertTrue(key.getFirst().startsWith("v=DKIM1; k=rsa; p=MIGf") && key.getFirst().endsWith("QIDAQAB"), key.getFirst());
+		assertEquals(us.bringardner.net.dns.resolve.LookupResult.Status.NXDOMAIN, r.txt("none._domainkey.mx.test").getStatus());
+		assertTrue(r.txt("elsewhere.test").isTempFail(), "SERVFAIL");
+
+		String msg = "From: joe@mx.test\r\nTo: ann@example.net\r\nSubject: hi\r\n\r\nHello\r\n";
+		us.bringardner.net.smtp.dkim.DkimSigner signer = new us.bringardner.net.smtp.dkim.DkimSigner("mx.test", "test",
+				us.bringardner.net.smtp.dkim.DkimKeys.privateKey(TestDkim.RSA_SECRET));
+		String field = signer.sign(new java.io.ByteArrayInputStream(msg.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+		List<us.bringardner.net.smtp.dkim.DkimResult> results = new us.bringardner.net.smtp.dkim.DkimVerifier(r::txt)
+				.verify(new java.io.ByteArrayInputStream((field + msg).getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+		assertTrue(results.get(0).isPass(), results.toString());
 	}
 
 	@Test

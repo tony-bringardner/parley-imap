@@ -29,6 +29,9 @@ import us.bringardner.net.smtp.MailAddress;
 import us.bringardner.net.smtp.SMTP;
 import us.bringardner.net.smtp.SmtpInput;
 import us.bringardner.net.smtp.SmtpStreams;
+import us.bringardner.net.smtp.dkim.DkimResult;
+import us.bringardner.net.smtp.dkim.HeaderFields;
+import us.bringardner.net.smtp.queue.HeaderRewriter;
 import us.bringardner.net.smtp.queue.MailQueue;
 import us.bringardner.net.smtp.queue.QueueEntry;
 import us.bringardner.net.smtp.queue.QueuedRecipient;
@@ -549,6 +552,12 @@ public class SmtpRequestProcessor extends AbstractCommandProcessor implements SM
 			}
 			insertAfterTrace(t, add.toString());
 		}
+		if (mayRelay()) {
+			// our own users' mail: sign it with the key of its From domain, if any
+			getQueue().dkimSign(t.id, t.incoming);
+		} else if (getQueue().getConfig().getDkim().isVerify()) {
+			verifyDkim(t);
+		}
 		QueueEntry e = new QueueEntry(t.id);
 		e.setFrom(t.from);
 		e.setBody(t.body);
@@ -570,6 +579,39 @@ public class SmtpRequestProcessor extends AbstractCommandProcessor implements SM
 			throw ex;
 		}
 		reply(OK, "2.0.0", "Ok: queued as " + t.id);
+	}
+
+	/**
+	 * Verify the message's DKIM signatures and record the results in an
+	 * Authentication-Results field after our Received field (RFC 8601).
+	 * Authentication-Results fields that claim to be from this server are
+	 * removed (section 5). The message is accepted whatever the result.
+	 */
+	private void verifyDkim(Transaction t) throws IOException {
+		String host = getSmtpServer().getHostname();
+		List<DkimResult> results;
+		try (InputStream i = new BufferedInputStream(t.incoming.getInputStream(), 64 * 1024)) {
+			results = getQueue().getConfig().getDkim().verify(i);
+		} catch (IOException | RuntimeException e) {
+			logError("DKIM verification of " + t.id + " failed", e);
+			return;
+		}
+		StringBuilder ar = new StringBuilder("Authentication-Results: ").append(host);
+		for (DkimResult r : results) {
+			ar.append(";\r\n\t").append(r.toAuthResults());
+		}
+		ar.append("\r\n");
+		HeaderRewriter.insertAfterFirst(t.incoming, getQueue().incoming(t.id + "a"), ar.toString(),
+				f -> f.is("Authentication-Results") && host.equalsIgnoreCase(authServId(f.getValue())));
+	}
+
+	/** The authserv-id of an Authentication-Results value: the text before the first ';' (version and comments removed). */
+	static String authServId(String value) {
+		String v = HeaderFields.stripComments(value);
+		int semi = v.indexOf(';');
+		String id = (semi < 0 ? v : v.substring(0, semi)).trim();
+		int sp = id.indexOf(' ');
+		return sp < 0 ? id : id.substring(0, sp); // "host 1" has a version
 	}
 
 	/** Add header lines after our Received header (the first header). */

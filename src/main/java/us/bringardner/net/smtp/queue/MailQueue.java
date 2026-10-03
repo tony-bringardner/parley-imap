@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.System.Logger.Level;
+import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -24,6 +25,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import us.bringardner.io.filesource.FileSource;
 import us.bringardner.net.smtp.MailAddress;
 import us.bringardner.net.smtp.SmtpStreams;
+import us.bringardner.net.smtp.dkim.Dkim;
+import us.bringardner.net.smtp.dkim.DkimSigner;
+import us.bringardner.net.smtp.dkim.HeaderFields;
 
 /**
  * The persistent mail queue of the SMTP server. A message accepted by the server
@@ -233,6 +237,45 @@ public class MailQueue {
 	}
 
 	/**
+	 * Sign a message that is being queued with the DKIM key of its From domain
+	 * (see {@link Dkim#signerFor(String)}): the
+	 * DKIM-Signature field is put at the top of the file. Nothing happens if
+	 * no key fits. A failure is logged and the message stays unsigned.
+	 *
+	 * @param id       the queue id (for the temporary file)
+	 * @param incoming the message, from {@link #incoming(String)}
+	 * @return true if the message was signed
+	 */
+	public boolean dkimSign(String id, FileSource incoming) {
+		Dkim dkim = config.getDkim();
+		if (!dkim.isSigning()) {
+			return false;
+		}
+		try {
+			String domain = null;
+			try (InputStream in = new BufferedInputStream(incoming.getInputStream(), 64 * 1024)) {
+				HeaderFields.Field from = HeaderFields.read(in).get("From");
+				if (from != null) {
+					domain = HeaderFields.addressDomain(from.getValue());
+				}
+			}
+			DkimSigner signer = dkim.signerFor(domain);
+			if (signer == null) {
+				return false;
+			}
+			String field;
+			try (InputStream in = new BufferedInputStream(incoming.getInputStream(), 64 * 1024)) {
+				field = signer.sign(in);
+			}
+			HeaderRewriter.prepend(incoming, incoming(id + "k"), field);
+			return true;
+		} catch (IOException | GeneralSecurityException | RuntimeException ex) {
+			LOG.log(Level.WARNING, "Can't DKIM-sign " + id + "; it is sent unsigned", ex);
+			return false;
+		}
+	}
+
+	/**
 	 * Queue a message from code (e.g. for an application sending mail). The
 	 * content is copied with CRLF line ends.
 	 */
@@ -260,8 +303,8 @@ public class MailQueue {
 				size += n;
 			}
 		}
-		e.size = size;
 		e.body = eight ? QueueEntry.Body.EIGHT_BIT : QueueEntry.Body.SEVEN_BIT;
+		e.size = dkimSign(e.id, in) ? in.length() : size;
 		commit(e, in);
 		return e;
 	}
@@ -456,7 +499,7 @@ public class MailQueue {
 			d.from = null; // never bounce a bounce (RFC 5321 section 4.5.5)
 			FileSource in = incoming(d.id);
 			DsnBuilder.Written w = DsnBuilder.write(in, config, e, content, kind, rcpts, acts, e.created + config.getMaxAge());
-			d.size = w.size;
+			d.size = dkimSign(d.id, in) ? in.length() : w.size;
 			d.smtpUtf8 = w.utf8;
 			d.body = QueueEntry.Body.EIGHT_BIT;
 			d.recipients.add(new QueuedRecipient(e.from, null, EnumSet.of(QueuedRecipient.Notify.NEVER)));
